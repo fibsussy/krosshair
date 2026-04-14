@@ -10,7 +10,7 @@ jobs:
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Install tools
@@ -40,8 +40,9 @@ jobs:
         run: |
           sed -i "s/pkgver=.*/pkgver=${{ steps.bump.outputs.new_version }}/" PKGBUILD
           sed -i "s/pkgver=.*/pkgver=${{ steps.bump.outputs.new_version }}/" aur/PKGBUILD
+          cd aur && makepkg --printsrcinfo > .SRCINFO
       - name: Upload version files (uncommitted)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: version-files
           path: |
@@ -52,10 +53,10 @@ jobs:
     needs: [version]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: version-files
           path: .
@@ -77,29 +78,30 @@ jobs:
           fi
       - name: Create tarball
         run: |
-          mkdir -p krosshair-linux-${{ steps.arch.outputs.arch_name }}
-          cp lib/krosshair.so krosshair-linux-${{ steps.arch.outputs.arch_name }}/
-          cp krosshair.json krosshair-linux-${{ steps.arch.outputs.arch_name }}/
-          tar -czf krosshair-linux-${{ steps.arch.outputs.arch_name }}.tar.gz -C krosshair-linux-${{ steps.arch.outputs.arch_name }} .
+          mkdir -p krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }}
+          cp lib/krosshair.so krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }}/
+          cp krosshair.json krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }}/
+          cp LICENSE krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }}/ 2>/dev/null || true
+          tar -czf krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }}.tar.gz -C krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }} .
       - name: Generate checksum
-        run: sha256sum krosshair-linux-${{ steps.arch.outputs.arch_name }}.tar.gz > krosshair-linux-${{ steps.arch.outputs.arch_name }}.sha256
+        run: sha256sum krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }}.tar.gz > krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }}.sha256
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: krosshair-linux-${{ steps.arch.outputs.arch_name }}
+          name: krosshair-${{ needs.version.outputs.new_version }}-${{ steps.arch.outputs.arch_name }}
           path: |
-            krosshair-linux-*.tar.gz
-            krosshair-linux-*.sha256
+            krosshair-*.tar.gz
+            krosshair-*.sha256
 
   commit-and-release:
     needs: [version, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
       - name: Restore version files from successful build
@@ -125,9 +127,18 @@ jobs:
           chmod 600 ~/.ssh/aur
           ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
           rm -rf aur
-          git clone ssh://aur@aur.archlinux.org/krosshair.git aur
-          cp -r artifacts/version-files/aur/* aur/
-          cd aur
+          if git clone ssh://aur@aur.archlinux.org/krosshair.git aur 2>&1; then
+            echo "Cloned existing AUR repo"
+            cp -r artifacts/version-files/aur/* aur/
+            cd aur
+          else
+            echo "Creating new AUR repo"
+            mkdir aur
+            cp -r artifacts/version-files/aur/* aur/
+            cd aur
+            git init
+            git remote add origin ssh://aur@aur.archlinux.org/krosshair.git
+          fi
           makepkg --printsrcinfo > .SRCINFO
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
@@ -148,7 +159,7 @@ jobs:
           gh release create "v${{ needs.version.outputs.new_version }}" \
             --title "v${{ needs.version.outputs.new_version }}" \
             --notes "Release v${{ needs.version.outputs.new_version }}" \
-            artifacts/krosshair-linux-${ARCH_NAME}/krosshair-linux-${ARCH_NAME}.tar.gz \
-            artifacts/krosshair-linux-${ARCH_NAME}/krosshair-linux-${ARCH_NAME}.sha256
+            artifacts/krosshair-${{ needs.version.outputs.new_version }}-${ARCH_NAME}/krosshair-${{ needs.version.outputs.new_version }}-${ARCH_NAME}.tar.gz \
+            artifacts/krosshair-${{ needs.version.outputs.new_version }}-${ARCH_NAME}/krosshair-${{ needs.version.outputs.new_version }}-${ARCH_NAME}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

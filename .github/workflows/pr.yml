@@ -7,7 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -25,6 +25,7 @@ jobs:
           mkdir -p krosshair-linux-${ARCH_NAME}
           cp lib/krosshair.so krosshair-linux-${ARCH_NAME}/
           cp krosshair.json krosshair-linux-${ARCH_NAME}/
+          cp LICENSE krosshair-linux-${ARCH_NAME}/ 2>/dev/null || true
           tar -czf krosshair-linux-${ARCH_NAME}.tar.gz -C krosshair-linux-${ARCH_NAME} .
       - name: Generate checksum
         run: |
@@ -36,7 +37,7 @@ jobs:
           fi
           sha256sum krosshair-linux-${ARCH_NAME}.tar.gz > krosshair-linux-${ARCH_NAME}.sha256
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: krosshair-linux
           path: |
