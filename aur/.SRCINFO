@@ -1,0 +1,13 @@
+pkgbase = krosshair
+pkgdesc = Crosshair overlay for games on linux using Vulkan
+pkgver = 0.1.0
+pkgrel = 1
+url = https://github.com/fibsussy/krosshair
+arch = x86_64
+arch = aarch64
+license = GPL3
+depends = libvulkan-driver
+depends = libgl
+depends = libx11
+
+pkgname = krosshair
