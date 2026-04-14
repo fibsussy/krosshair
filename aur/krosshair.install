@@ -1,0 +1,28 @@
+post_install() {
+    echo ""
+    echo "==> krosshair installed successfully!"
+    echo ""
+    echo "==> Getting Started:"
+    echo ""
+    echo "    1. Run your game with KROSSHAIR=1 set"
+    echo "       Example: KROSSHAIR=1 your-game"
+    echo ""
+    echo "    2. For Steam games, add to launch options:"
+    echo "       KROSSHAIR=1 %command%"
+    echo ""
+    echo "==> Customization:"
+    echo "       KROSSHAIR_IMG=/path/to/crosshair.png"
+    echo "       KROSSHAIR_SCALE=1.0"
+    echo ""
+    echo "==> Sample crosshairs installed at:"
+    echo "       /usr/share/krosshair/crosshairs/"
+    echo ""
+    echo "==> For more info: https://github.com/fibsussy/krosshair"
+    echo ""
+}
+
+post_upgrade() {
+    echo ""
+    echo "==> krosshair upgraded successfully!"
+    echo ""
+}

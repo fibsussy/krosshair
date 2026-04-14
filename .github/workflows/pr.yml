@@ -1,0 +1,45 @@
+name: Build to test PR
+
+on:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev libgl-dev libx11-dev gcc make
+      - name: Build binary
+        run: make
+      - name: Create tarball
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            ARCH_NAME="x86_64"
+          elif [ "$ARCH" = "aarch64" ]; then
+            ARCH_NAME="aarch64"
+          fi
+          mkdir -p krosshair-linux-${ARCH_NAME}
+          cp lib/krosshair.so krosshair-linux-${ARCH_NAME}/
+          cp krosshair.json krosshair-linux-${ARCH_NAME}/
+          cp LICENSE krosshair-linux-${ARCH_NAME}/ 2>/dev/null || true
+          tar -czf krosshair-linux-${ARCH_NAME}.tar.gz -C krosshair-linux-${ARCH_NAME} .
+      - name: Generate checksum
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            ARCH_NAME="x86_64"
+          elif [ "$ARCH" = "aarch64" ]; then
+            ARCH_NAME="aarch64"
+          fi
+          sha256sum krosshair-linux-${ARCH_NAME}.tar.gz > krosshair-linux-${ARCH_NAME}.sha256
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: krosshair-linux
+          path: |
+            krosshair-linux-*.tar.gz
+            krosshair-linux-*.sha256
