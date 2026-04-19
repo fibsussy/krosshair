@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_core.h>
@@ -26,6 +27,15 @@
         for (const struct VkBaseInStructure* __iter =        \
                  (const struct VkBaseInStructure*)(__start); \
              __iter; __iter = __iter->pNext)
+
+#define KROSSHAIR_LOG(fmt, ...) \
+        do { \
+                FILE* _kf = fopen("/tmp/krosshair.log", "a"); \
+                if (_kf) { \
+                        fprintf(_kf, fmt, ##__VA_ARGS__); \
+                        fclose(_kf); \
+                } \
+        } while (0)
 
 #define VK_CHECK(expr)                        \
         do {                                  \
@@ -383,6 +393,9 @@ typedef struct swapchain_data {
         VkBuffer crosshair_upload_buffer;
         VkDeviceMemory crosshair_upload_buffer_mem;
 
+        char* crosshair_path;
+        struct timespec crosshair_mtime;
+
         krosshair_draw_t* draw;
 
 } swapchain_data_t;
@@ -591,17 +604,40 @@ static void create_or_resize_buffer(device_data_t* device_data,
 static void shutdown_krosshair_image(swapchain_data_t* data)
 {
         device_data_t* device_data = data->device_data;
-        device_data->vtable.DestroyImageView(device_data->device,
-                                             data->crosshair_image_view, NULL);
-        device_data->vtable.DestroyImage(device_data->device,
-                                         data->crosshair_image, NULL);
-        device_data->vtable.FreeMemory(device_data->device, data->crosshair_mem,
-                                       NULL);
 
-        device_data->vtable.DestroyBuffer(device_data->device,
-                                          data->crosshair_upload_buffer, NULL);
-        device_data->vtable.FreeMemory(device_data->device,
-                                       data->crosshair_upload_buffer_mem, NULL);
+        if (data->crosshair_image_view) {
+                device_data->vtable.DestroyImageView(device_data->device,
+                                                     data->crosshair_image_view, NULL);
+                data->crosshair_image_view = VK_NULL_HANDLE;
+        }
+        if (data->crosshair_image) {
+                device_data->vtable.DestroyImage(device_data->device,
+                                                 data->crosshair_image, NULL);
+                data->crosshair_image = VK_NULL_HANDLE;
+        }
+        if (data->crosshair_mem) {
+                device_data->vtable.FreeMemory(device_data->device, data->crosshair_mem,
+                                               NULL);
+                data->crosshair_mem = VK_NULL_HANDLE;
+        }
+
+        if (data->crosshair_upload_buffer) {
+                device_data->vtable.DestroyBuffer(device_data->device,
+                                                  data->crosshair_upload_buffer, NULL);
+                data->crosshair_upload_buffer = VK_NULL_HANDLE;
+        }
+        if (data->crosshair_upload_buffer_mem) {
+                device_data->vtable.FreeMemory(device_data->device,
+                                               data->crosshair_upload_buffer_mem, NULL);
+                data->crosshair_upload_buffer_mem = VK_NULL_HANDLE;
+        }
+
+        if (data->descriptor_set) {
+                device_data->vtable.FreeDescriptorSets(device_data->device,
+                                                       data->descriptor_pool,
+                                                       1, &data->descriptor_set);
+                data->descriptor_set = VK_NULL_HANDLE;
+        }
 }
 
 static void update_image_descriptor(swapchain_data_t* data,
@@ -811,11 +847,57 @@ static char* get_crosshair_file(const char* path)
         return expanded_str;
 }
 
+static int get_file_mtime(const char* path, struct timespec* mtime)
+{
+        struct stat st;
+        if (stat(path, &st) != 0) return -1;
+        *mtime = st.st_mtim;
+        return 0;
+}
+
 static void ensure_swapchain_crosshair(swapchain_data_t* data,
                                        VkCommandBuffer cmd_buffer)
 {
         device_data_t* device_data = data->device_data;
-        if (data->crosshair_uploaded) return;
+
+        char* crosshair_path = get_crosshair_file(getenv("KROSSHAIR_IMG"));
+        int using_file = (crosshair_path != NULL);
+
+        if (data->crosshair_uploaded) {
+                int needs_reload = 0;
+
+                if (using_file && data->crosshair_path) {
+                        if (strcmp(data->crosshair_path, crosshair_path) != 0) {
+                                KROSSHAIR_LOG("[KROSSHAIR] path changed, reloading\n");
+                                needs_reload = 1;
+                        } else {
+                                struct timespec new_mtime;
+                                if (get_file_mtime(crosshair_path, &new_mtime) == 0) {
+                                        if (new_mtime.tv_sec != data->crosshair_mtime.tv_sec ||
+                                            new_mtime.tv_nsec != data->crosshair_mtime.tv_nsec) {
+                                                KROSSHAIR_LOG("[KROSSHAIR] mtime changed (%ld.%ld -> %ld.%ld), reloading\n",
+                                                       data->crosshair_mtime.tv_sec,
+                                                       data->crosshair_mtime.tv_nsec,
+                                                       new_mtime.tv_sec,
+                                                       new_mtime.tv_nsec);
+                                                needs_reload = 1;
+                                        }
+                                }
+                        }
+                }
+
+                if (!needs_reload) {
+                        free(crosshair_path);
+                        return;
+                }
+
+                KROSSHAIR_LOG("[KROSSHAIR] shutting down old crosshair image\n");
+
+                shutdown_krosshair_image(data);
+                data->crosshair_uploaded = 0;
+                free(data->crosshair_path);
+                data->crosshair_path = NULL;
+        }
 
         int tex_width;
         int tex_height;
@@ -823,18 +905,16 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
         VkDeviceSize image_size;
         stbi_uc* pixels;
 
-        char* crosshair_path = get_crosshair_file(getenv("KROSSHAIR_IMG"));
-
-        if (crosshair_path) {
+        if (using_file) {
                 pixels = stbi_load(crosshair_path, &tex_width, &tex_height,
                                    &tex_channels, STBI_rgb_alpha);
-                free(crosshair_path);
                 image_size = tex_width * tex_height * 4;
 
                 if (!pixels) {
                         printf(
                             "[KROSSHAIR_ERROR] failed to load crosshair "
                             "image.\n");
+                        free(crosshair_path);
                         return;
                 }
 
@@ -848,7 +928,15 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
                     tex_height, &data->crosshair_upload_buffer,
                     &data->crosshair_upload_buffer_mem, data->crosshair_image);
                 stbi_image_free(pixels);
+
+                data->crosshair_path = crosshair_path;
+                get_file_mtime(crosshair_path, &data->crosshair_mtime);
+                KROSSHAIR_LOG("[KROSSHAIR] loaded crosshair from: %s (mtime %ld.%ld)\n",
+                              crosshair_path,
+                              data->crosshair_mtime.tv_sec,
+                              data->crosshair_mtime.tv_nsec);
         } else {
+                free(crosshair_path);
                 tex_width            = default_crosshair_width;
                 tex_height           = default_crosshair_height;
                 image_size           = tex_width * tex_height * 4;
