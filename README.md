@@ -5,26 +5,38 @@ A crosshair overlay for games on linux using vulkan.
 ![quake](img/quake-crosshair.png)
 
 ## Installation
-`make && make install`
 
-On nixos-unstable: Add `krosshair` (or clone and add `(callPackage <local krosshair repo path>/derivation.nix { })`) to packages and `nixos-rebuild switch`.
+### AUR
+
+```bash
+yay -S krosshair
+```
+
+### From source
+
+```bash
+git clone https://github.com/fibsussy/krosshair.git
+cd krosshair
+make
+```
 
 ## Usage
-Simply start the your game with `KROSSHAIR=1` set. When using steam, put `KROSSHAIR=1 %command%` into the launch options of your game. Additionally you can use the following variables to customize your crosshair.
-- `KROSSHAIR_IMG=/path/to/crosshair-image.png` (i've provided some crosshairs in [here](https://github.com/krob64/krosshair/tree/main/crosshairs), copy them wherever you like)
-    - alternatively you can use a [crosshair generator site](https://crosshair.themeta.gg/) (or [this one](https://guywiddacaptain.github.io/aimX/))
+
+```bash
+export KROSSHAIR=1
+your-game
+```
+
+For Steam games, add `KROSSHAIR=1 %command%` to launch options.
+
 ## crosshair-maker integration
 
-If you have [crosshair-maker](https://github.com/fibsussy/crosshair-maker) installed, krosshair automatically uses your currently selected crosshair — no configuration needed. The currently active project's exported PNG (`~/.config/crosshair-maker/projects/current.png`) is loaded as the overlay. You can still override this with `KROSSHAIR_IMG` if you want.
+krosshair works out of the box with [crosshair-maker](https://github.com/fibsussy/crosshair-maker), a crosshair overlay creator with SVG rendering and preview. The currently selected crosshair is automatically exported to `~/.config/crosshair-maker/projects/current.png`, which krosshair picks up as its default — just launch your game with `export KROSSHAIR=1` and go.
 
-- `KROSSHAIR_SCALE=1.0` (scaling the scrosshair may make it look blurry, i'd suggest to just create a bigger/smaller crosshair)
+You can override the image with `export KROSSHAIR_IMG=/path/to/crosshair.png` if you want to use a custom file.
 
 ## Can i get banned for this?
 I don't know, use at your own risk. I've only used it in Quake Champions and STRAFTAT, both of which don't really have an anticheat.
-
-## Setting up requirements
-Needs Vulkan libs to build.
-All requirements can be set up with `nix-shell' when nix is installed.
 
 ## Issues
 As of now, the overlay leaks a bit of memory everytime you alt-tab out of/into the game, as well as everytime the window is being resized and upon resolution changes. It's not a big leak and shouldn't cause any problems, but it's still worth noting.

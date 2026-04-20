@@ -962,26 +962,8 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
                     &data->crosshair_upload_buffer_mem, data->crosshair_image);
         }
 
-        float scale           = 1;
-        const char* scale_str = getenv("KROSSHAIR_SCALE");
-        if (scale_str) {
-                char* end = NULL;
-                for (float scale_cvt = strtof(scale_str, &end); scale_str != end;
-                     scale_cvt = strtof(scale_str, &end)) {
-                        printf("got scale: %f\n", scale_cvt);
-                        scale = scale_cvt; 
-                        scale_str = end;
-                        if (errno == ERANGE) {
-                                printf("KROSSHAIR_SCALE invalid.\n");
-                                scale = 1;
-                        }
-                }
-        }
-
-        printf("scale: %f\n", scale);
-
         setup_vertices((float)data->width, (float)data->height,
-                       (float)tex_height, (float)tex_width, scale);
+                       (float)tex_height, (float)tex_width, 1.0f);
 
         data->crosshair_uploaded = 1;
 }
