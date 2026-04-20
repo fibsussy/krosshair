@@ -31,9 +31,17 @@ For Steam games, add `KROSSHAIR=1 %command%` to launch options.
 
 ## crosshair-maker integration
 
-krosshair works out of the box with [crosshair-maker](https://github.com/fibsussy/crosshair-maker), a crosshair overlay creator with SVG rendering and preview. The currently selected crosshair is automatically exported to `~/.config/crosshair-maker/projects/current.png`, which krosshair picks up as its default — just launch your game with `export KROSSHAIR=1` and go.
+krosshair works out of the box with [crosshair-maker](https://github.com/fibsussy/crosshair-maker), a crosshair overlay creator with SVG rendering and preview. The currently selected crosshair is automatically exported to `~/.config/crosshair-maker/projects/current.png`, which krosshair picks up as its default — just launch your game with `KROSSHAIR=1` and go.
 
 You can override the image with `export KROSSHAIR_IMG=/path/to/crosshair.png` if you want to use a custom file.
+
+To test the full setup together with `vkcube`:
+
+```sh
+$ yay -Sy krosshair crosshair-maker vulkan-tools
+$ KROSSHAIR=1 vkcube &
+$ crosshair-maker &
+```
 
 ## Can i get banned for this?
 I don't know, use at your own risk. I've only used it in Quake Champions and STRAFTAT, both of which don't really have an anticheat.
