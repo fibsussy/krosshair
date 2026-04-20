@@ -841,12 +841,35 @@ static int get_file_mtime(const char* path, struct timespec* mtime)
         return 0;
 }
 
+// malloc's returned string, free later
+// returns crosshair-maker default if installed and no explicit KROSSHAIR_IMG set
+static char* get_crosshair_path(void)
+{
+        const char* explicit = getenv("KROSSHAIR_IMG");
+        if (explicit)
+                return get_crosshair_file(explicit);
+
+        const char* home = getenv("HOME");
+        if (!home)
+                return NULL;
+
+        char cm_path[4096];
+        snprintf(cm_path, sizeof(cm_path),
+                 "%s/.config/crosshair-maker/projects/current.png", home);
+
+        struct stat st;
+        if (stat(cm_path, &st) == 0)
+                return strdup(cm_path);
+
+        return NULL;
+}
+
 static void ensure_swapchain_crosshair(swapchain_data_t* data,
                                        VkCommandBuffer cmd_buffer)
 {
         device_data_t* device_data = data->device_data;
 
-        char* crosshair_path = get_crosshair_file(getenv("KROSSHAIR_IMG"));
+        char* crosshair_path = get_crosshair_path();
         int using_file = (crosshair_path != NULL);
 
         if (data->crosshair_uploaded) {
