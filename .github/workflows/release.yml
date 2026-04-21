@@ -186,6 +186,10 @@ jobs:
             cd /home/builduser
             if git clone ssh://aur@aur.archlinux.org/krosshair.git aur-push 2>&1; then
               echo "Cloned existing AUR repo"
+              cd aur-push
+              git fetch origin
+              git reset --hard origin/master
+              cd ..
             else
               echo "Creating new AUR repo"
               mkdir -p aur-push
@@ -195,6 +199,7 @@ jobs:
               cd ..
             fi
 
+            rm -rf aur-push/*
             cp aur/PKGBUILD aur-push/
             cp aur/krosshair.install aur-push/
 
