@@ -182,12 +182,9 @@ jobs:
           cp -r aur /home/builduser/aur
           chown -R builduser:builduser /home/builduser/aur
 
-          sudo -u builduser VERSION="$VERSION" GIT_SSH_COMMAND="ssh -i /home/builduser/.ssh/aur -o StrictHostKeyChecking=no -v" bash -c '
+          sudo -u builduser VERSION="$VERSION" GIT_SSH_COMMAND="ssh -i /home/builduser/.ssh/aur -o StrictHostKeyChecking=no" bash -c '
             cd /home/builduser
-            echo "Testing SSH connection..."
-            ssh -T aur@aur.archlinux.org 2>&1 || true
-            echo "Attempting to clone AUR repo..."
-            GIT_SSH_COMMAND="ssh -i /home/builduser/.ssh/aur -o StrictHostKeyChecking=no" git clone ssh://aur@aur.archlinux.org/krosshair.git aur-push 2>&1 || true
+            git clone ssh://aur@aur.archlinux.org/krosshair.git aur-push 2>&1 || true
             if [ -d "aur-push/.git" ]; then
               echo "Cloned existing AUR repo"
               cd aur-push
