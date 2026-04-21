@@ -6,9 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_core.h>
+#include <limits.h>
 #include <math.h>
 
 #include "../include/dispatch.h"
@@ -311,6 +313,26 @@ typedef struct queue_data {
         uint32_t family_index;
 } queue_data_t;
 
+typedef struct static_vk_resources {
+        VkSampler crosshair_sampler;
+        VkDescriptorPool descriptor_pool;
+        VkDescriptorSetLayout descriptor_layout;
+        VkPipelineLayout pipeline_layout;
+        VkPipeline pipeline;
+        VkRenderPass render_pass;
+        VkCommandPool cmd_pool;
+        VkSemaphore crossengine_semaphore;
+        VkSemaphore semaphore;
+        VkFence fence;
+        VkBuffer vertex_buffer;
+        VkDeviceMemory vertex_buffer_mem;
+        VkDeviceSize vertex_buffer_size;
+        VkBuffer index_buffer;
+        VkDeviceMemory index_buffer_mem;
+        VkDeviceSize index_buffer_size;
+        int initialized;
+} static_vk_resources_t;
+
 typedef struct device_data {
         device_dispatch_table_t vtable;
         instance_data_t* instance;
@@ -321,6 +343,7 @@ typedef struct device_data {
         struct queue_data* graphic_queue;
         struct queue_data* queues[16];  // 16 should be enough?
         uint32_t queue_count;
+        static_vk_resources_t* vk_resources;
 } device_data_t;
 
 typedef struct command_buffer_data {
@@ -344,6 +367,9 @@ typedef struct krosshair_draw {
         VkBuffer index_buffer;
         VkDeviceMemory index_buffer_mem;
         VkDeviceSize index_buffer_size;
+
+        int vertex_buffer_initialized;
+        int index_buffer_initialized;
 } krosshair_draw_t;
 
 typedef struct swapchain_data {
@@ -382,6 +408,16 @@ typedef struct swapchain_data {
         char* crosshair_path;
         struct timespec crosshair_mtime;
 
+        /* crosshair texture dimensions (for vertex setup) */
+        int crosshair_tex_width;
+
+        /* GIF animation state */
+        int gif_frame_count;
+        int gif_frame_height;       /* height of a single frame */
+        int* gif_delays;            /* delay per frame in ms */
+        int gif_current_frame;
+        struct timespec gif_last_frame_time;
+
         krosshair_draw_t* draw;
 
 } swapchain_data_t;
@@ -408,11 +444,17 @@ typedef struct swapchain_data {
 //
 vertex_t vertices[4] = {0};
 
-static void setup_vertices(float canvas_width, float canvas_height,
-                           float tex_width, float tex_height, float scale)
+/*
+ * Set up the quad vertices for rendering.
+ *   uv_top / uv_bottom: vertical UV range (0..1 for full texture,
+ *   or a sub-range for atlas frame selection)
+ */
+static void setup_vertices_uv(float canvas_width, float canvas_height,
+                               float tex_width, float tex_height, float scale,
+                               float uv_top, float uv_bottom)
 {
         float width_ndc  = ((tex_width * scale) / canvas_width);
-        float height_ndc = ((tex_width * scale)/ canvas_height) ;
+        float height_ndc = ((tex_width * scale) / canvas_height);
 
         /* should fix even-length crosshairs */
         float pixel_offset_x =
@@ -422,16 +464,23 @@ static void setup_vertices(float canvas_width, float canvas_height,
 
         vertices[0].pos =
             (vec2_t){-width_ndc + pixel_offset_x, -height_ndc + pixel_offset_y};
-        vertices[0].tex_pos = (vec2_t){0.0f, 0.0f};
+        vertices[0].tex_pos = (vec2_t){0.0f, uv_top};
         vertices[1].pos =
             (vec2_t){width_ndc + pixel_offset_x, -height_ndc + pixel_offset_y};
-        vertices[1].tex_pos = (vec2_t){1.0f, 0.0f};
+        vertices[1].tex_pos = (vec2_t){1.0f, uv_top};
         vertices[2].pos =
             (vec2_t){width_ndc + pixel_offset_x, height_ndc + pixel_offset_y};
-        vertices[2].tex_pos = (vec2_t){1.0f, 1.0f};
+        vertices[2].tex_pos = (vec2_t){1.0f, uv_bottom};
         vertices[3].pos =
             (vec2_t){-width_ndc + pixel_offset_x, height_ndc + pixel_offset_y};
-        vertices[3].tex_pos = (vec2_t){0.0f, 1.0f};
+        vertices[3].tex_pos = (vec2_t){0.0f, uv_bottom};
+}
+
+static void setup_vertices(float canvas_width, float canvas_height,
+                           float tex_width, float tex_height, float scale)
+{
+        setup_vertices_uv(canvas_width, canvas_height, tex_width, tex_height,
+                          scale, 0.0f, 1.0f);
 }
 
 uint16_t indices[] = {0, 1, 2, 2, 3, 0};
@@ -619,10 +668,92 @@ static void shutdown_krosshair_image(swapchain_data_t* data)
         }
 
         if (data->descriptor_set) {
-                device_data->vtable.FreeDescriptorSets(device_data->device,
-                                                       data->descriptor_pool,
-                                                       1, &data->descriptor_set);
+                /* use ResetDescriptorPool instead of FreeDescriptorSets
+                 * because the pool was created without
+                 * VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT */
+                device_data->vtable.ResetDescriptorPool(device_data->device,
+                                                        data->descriptor_pool, 0);
                 data->descriptor_set = VK_NULL_HANDLE;
+        }
+
+        /* clean up GIF animation state */
+        if (data->gif_delays) {
+                free(data->gif_delays);
+                data->gif_delays = NULL;
+        }
+        data->gif_frame_count    = 0;
+        data->gif_frame_height   = 0;
+        data->gif_current_frame  = 0;
+        data->crosshair_tex_width = 0;
+}
+
+static void destroy_draw(swapchain_data_t* data, krosshair_draw_t* draw);
+
+static void destroy_swapchain_data(swapchain_data_t* data)
+{
+        if (!data) return;
+
+        device_data_t* device_data = data->device_data;
+
+        if (data->draw) {
+                destroy_draw(data, data->draw);
+                data->draw = NULL;
+        }
+
+        shutdown_krosshair_image(data);
+
+        if (data->descriptor_pool != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyDescriptorPool(device_data->device,
+                                                           data->descriptor_pool, NULL);
+                data->descriptor_pool = VK_NULL_HANDLE;
+        }
+        if (data->descriptor_layout != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyDescriptorSetLayout(device_data->device,
+                                                               data->descriptor_layout, NULL);
+                data->descriptor_layout = VK_NULL_HANDLE;
+        }
+        if (data->crosshair_sampler != VK_NULL_HANDLE) {
+                device_data->vtable.DestroySampler(device_data->device,
+                                                   data->crosshair_sampler, NULL);
+                data->crosshair_sampler = VK_NULL_HANDLE;
+        }
+        if (data->pipeline != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyPipeline(device_data->device,
+                                                   data->pipeline, NULL);
+                data->pipeline = VK_NULL_HANDLE;
+        }
+        if (data->pipeline_layout != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyPipelineLayout(device_data->device,
+                                                          data->pipeline_layout, NULL);
+                data->pipeline_layout = VK_NULL_HANDLE;
+        }
+        if (data->render_pass != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyRenderPass(device_data->device,
+                                                      data->render_pass, NULL);
+                data->render_pass = VK_NULL_HANDLE;
+        }
+        if (data->cmd_pool != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyCommandPool(device_data->device,
+                                                       data->cmd_pool, NULL);
+                data->cmd_pool = VK_NULL_HANDLE;
+        }
+
+        for (uint32_t i = 0; i < data->n_images; i++) {
+                if (data->framebuffers[i] != VK_NULL_HANDLE) {
+                        device_data->vtable.DestroyFramebuffer(device_data->device,
+                                                                data->framebuffers[i], NULL);
+                        data->framebuffers[i] = VK_NULL_HANDLE;
+                }
+                if (data->image_views[i] != VK_NULL_HANDLE) {
+                        device_data->vtable.DestroyImageView(device_data->device,
+                                                            data->image_views[i], NULL);
+                        data->image_views[i] = VK_NULL_HANDLE;
+                }
+        }
+
+        if (data->crosshair_path) {
+                free(data->crosshair_path);
+                data->crosshair_path = NULL;
         }
 }
 
@@ -723,15 +854,25 @@ static VkDescriptorSet create_image_with_desc(swapchain_data_t* data,
         return descriptor_set;
 }
 
-static void upload_image_data(device_data_t* device_data,
-                              VkCommandBuffer cmd_buffer, void* pixels,
-                              VkDeviceSize upload_size, uint32_t width,
-                              uint32_t height, VkBuffer* upload_buffer,
-                              VkDeviceMemory* upload_buffer_mem, VkImage image)
+static void create_or_resize_upload_buffer(device_data_t* device_data,
+                                          VkBuffer* upload_buffer,
+                                          VkDeviceMemory* upload_buffer_mem,
+                                          VkDeviceSize new_size)
 {
+        if (*upload_buffer != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyBuffer(device_data->device, *upload_buffer,
+                                                  NULL);
+                *upload_buffer = VK_NULL_HANDLE;
+        }
+        if (*upload_buffer_mem) {
+                device_data->vtable.FreeMemory(device_data->device, *upload_buffer_mem,
+                                               NULL);
+                *upload_buffer_mem = VK_NULL_HANDLE;
+        }
+
         VkBufferCreateInfo buffer_info = {};
         buffer_info.sType              = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        buffer_info.size               = upload_size;
+        buffer_info.size               = new_size;
         buffer_info.usage              = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         buffer_info.sharingMode        = VK_SHARING_MODE_EXCLUSIVE;
         VK_CHECK(device_data->vtable.CreateBuffer(
@@ -751,6 +892,17 @@ static void upload_image_data(device_data_t* device_data,
             device_data->device, &upload_alloc_info, NULL, upload_buffer_mem));
         VK_CHECK(device_data->vtable.BindBufferMemory(
             device_data->device, *upload_buffer, *upload_buffer_mem, 0));
+}
+
+static void upload_image_data(device_data_t* device_data,
+                              VkCommandBuffer cmd_buffer, void* pixels,
+                              VkDeviceSize upload_size, uint32_t width,
+                              uint32_t height, VkBuffer* upload_buffer,
+                              VkDeviceMemory* upload_buffer_mem, VkImage image)
+{
+        /* always create the upload buffer - each swapchain has its own */
+        create_or_resize_upload_buffer(device_data, upload_buffer,
+                                       upload_buffer_mem, upload_size);
 
         char* map = NULL;
         VK_CHECK(device_data->vtable.MapMemory(device_data->device,
@@ -843,6 +995,7 @@ static int get_file_mtime(const char* path, struct timespec* mtime)
 
 // malloc's returned string, free later
 // returns crosshair-maker default if installed and no explicit KROSSHAIR_IMG set
+// tries current.apng first, then current.gif, then current.png
 static char* get_crosshair_path(void)
 {
         const char* explicit = getenv("KROSSHAIR_IMG");
@@ -854,15 +1007,422 @@ static char* get_crosshair_path(void)
                 return NULL;
 
         char cm_path[4096];
+        struct stat st;
+
+        /* prefer animated formats first, then static PNG */
+        snprintf(cm_path, sizeof(cm_path),
+                 "%s/.config/crosshair-maker/projects/current.apng", home);
+        if (stat(cm_path, &st) == 0)
+                return strdup(cm_path);
+
+        snprintf(cm_path, sizeof(cm_path),
+                 "%s/.config/crosshair-maker/projects/current.apng", home);
+        if (stat(cm_path, &st) == 0)
+                return strdup(cm_path);
+
         snprintf(cm_path, sizeof(cm_path),
                  "%s/.config/crosshair-maker/projects/current.png", home);
-
-        struct stat st;
         if (stat(cm_path, &st) == 0)
                 return strdup(cm_path);
 
         return NULL;
 }
+
+/* ───────────────────── APNG loader ───────────────────── */
+
+static const unsigned char png_signature[8] = {
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a
+};
+
+static uint32_t apng_read_be32(const unsigned char* p)
+{
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+               ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint16_t apng_read_be16(const unsigned char* p)
+{
+        return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+static void apng_write_be32(unsigned char* p, uint32_t v)
+{
+        p[0] = (v >> 24) & 0xff;
+        p[1] = (v >> 16) & 0xff;
+        p[2] = (v >> 8) & 0xff;
+        p[3] = v & 0xff;
+}
+
+/* CRC32 used by PNG chunk checksums */
+static uint32_t apng_crc32_table[256];
+static int apng_crc32_table_ready = 0;
+
+static void apng_crc32_init(void)
+{
+        if (apng_crc32_table_ready) return;
+        for (uint32_t i = 0; i < 256; i++) {
+                uint32_t c = i;
+                for (int j = 0; j < 8; j++)
+                        c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                apng_crc32_table[i] = c;
+        }
+        apng_crc32_table_ready = 1;
+}
+
+static uint32_t apng_crc32(const unsigned char* data, size_t len)
+{
+        uint32_t crc = 0xFFFFFFFF;
+        for (size_t i = 0; i < len; i++)
+                crc = apng_crc32_table[(crc ^ data[i]) & 0xff] ^ (crc >> 8);
+        return crc ^ 0xFFFFFFFF;
+}
+
+/* write a complete PNG chunk: length + type + data + crc */
+static size_t apng_write_chunk(unsigned char* out, const char* type,
+                               const unsigned char* data, uint32_t data_len)
+{
+        apng_write_be32(out, data_len);
+        memcpy(out + 4, type, 4);
+        if (data && data_len)
+                memcpy(out + 8, data, data_len);
+        /* CRC covers type + data */
+        uint32_t crc = apng_crc32(out + 4, 4 + data_len);
+        apng_write_be32(out + 8 + data_len, crc);
+        return 12 + data_len; /* length(4) + type(4) + data + crc(4) */
+}
+
+typedef struct apng_frame_info {
+        uint32_t width, height;
+        uint32_t x_offset, y_offset;
+        uint16_t delay_num, delay_den;
+        uint8_t dispose_op, blend_op;
+        /* raw compressed data (IDAT content or fdAT content minus seq) */
+        unsigned char* idat_data;
+        size_t idat_size;
+        size_t idat_capacity;
+} apng_frame_info_t;
+
+static void apng_frame_append_idat(apng_frame_info_t* f,
+                                    const unsigned char* data, size_t len)
+{
+        if (f->idat_size + len > f->idat_capacity) {
+                size_t new_cap = (f->idat_capacity == 0) ? 4096 : f->idat_capacity;
+                while (new_cap < f->idat_size + len)
+                        new_cap *= 2;
+                f->idat_data = realloc(f->idat_data, new_cap);
+                f->idat_capacity = new_cap;
+        }
+        memcpy(f->idat_data + f->idat_size, data, len);
+        f->idat_size += len;
+}
+
+/*
+ * Build a minimal valid PNG in memory for a single APNG frame,
+ * then decode it with stbi.  Returns RGBA pixels (caller must
+ * stbi_image_free), or NULL on failure.
+ *
+ * ihdr_raw: the 13 bytes of the original IHDR *data* (no length/type/crc)
+ */
+static stbi_uc* apng_decode_frame(const apng_frame_info_t* f,
+                                  const unsigned char* ihdr_raw,
+                                  int* out_w, int* out_h)
+{
+        /* build a new IHDR with the frame's dimensions */
+        unsigned char ihdr[13];
+        memcpy(ihdr, ihdr_raw, 13);
+        apng_write_be32(ihdr + 0, f->width);
+        apng_write_be32(ihdr + 4, f->height);
+
+        /* total PNG size: sig(8) + IHDR chunk(25) + IDAT chunk(12+data) + IEND(12) */
+        size_t png_size = 8 + 25 + (12 + f->idat_size) + 12;
+        unsigned char* png = malloc(png_size);
+        if (!png) return NULL;
+
+        size_t off = 0;
+        memcpy(png, png_signature, 8);
+        off += 8;
+        off += apng_write_chunk(png + off, "IHDR", ihdr, 13);
+        off += apng_write_chunk(png + off, "IDAT", f->idat_data, (uint32_t)f->idat_size);
+        off += apng_write_chunk(png + off, "IEND", NULL, 0);
+
+        int w, h, c;
+        stbi_uc* pixels = stbi_load_from_memory(png, (int)off, &w, &h, &c, 4);
+        free(png);
+
+        if (pixels) {
+                *out_w = w;
+                *out_h = h;
+        }
+        return pixels;
+}
+
+/* alpha-composite src over dst (premultiply-aware, straight alpha) */
+static void apng_blend_over(unsigned char* dst, const unsigned char* src,
+                            uint32_t canvas_w, uint32_t canvas_h,
+                            uint32_t x_off, uint32_t y_off,
+                            uint32_t fw, uint32_t fh)
+{
+        for (uint32_t y = 0; y < fh; y++) {
+                if (y + y_off >= canvas_h) break;
+                for (uint32_t x = 0; x < fw; x++) {
+                        if (x + x_off >= canvas_w) break;
+                        size_t di = ((y + y_off) * canvas_w + (x + x_off)) * 4;
+                        size_t si = (y * fw + x) * 4;
+                        uint8_t sa = src[si + 3];
+                        if (sa == 255) {
+                                memcpy(dst + di, src + si, 4);
+                        } else if (sa > 0) {
+                                uint8_t da = dst[di + 3];
+                                /* standard "over" blend */
+                                for (int k = 0; k < 3; k++) {
+                                        int sv = src[si + k] * sa;
+                                        int dv = dst[di + k] * da * (255 - sa) / 255;
+                                        int oa = sa + da * (255 - sa) / 255;
+                                        dst[di + k] = oa ? (uint8_t)((sv + dv) / oa) : 0;
+                                }
+                                dst[di + 3] = (uint8_t)(sa + da * (255 - sa) / 255);
+                        }
+                }
+        }
+}
+
+/* copy src frame pixels into canvas at offset (source replace, no blending) */
+static void apng_blend_source(unsigned char* dst, const unsigned char* src,
+                              uint32_t canvas_w, uint32_t canvas_h,
+                              uint32_t x_off, uint32_t y_off,
+                              uint32_t fw, uint32_t fh)
+{
+        for (uint32_t y = 0; y < fh; y++) {
+                if (y + y_off >= canvas_h) break;
+                size_t di = ((y + y_off) * canvas_w + x_off) * 4;
+                size_t si = (y * fw) * 4;
+                uint32_t copy_w = fw;
+                if (x_off + fw > canvas_w) copy_w = canvas_w - x_off;
+                memcpy(dst + di, src + si, copy_w * 4);
+        }
+}
+
+/* clear a region to transparent black */
+static void apng_clear_region(unsigned char* canvas, uint32_t canvas_w,
+                              uint32_t canvas_h, uint32_t x, uint32_t y,
+                              uint32_t w, uint32_t h)
+{
+        for (uint32_t row = y; row < y + h && row < canvas_h; row++) {
+                size_t off = (row * canvas_w + x) * 4;
+                uint32_t cw = w;
+                if (x + w > canvas_w) cw = canvas_w - x;
+                memset(canvas + off, 0, cw * 4);
+        }
+}
+
+/*
+ * Load an APNG file and return a vertical atlas of fully-composited frames,
+ * identical in layout to what stbi_load_gif_from_memory produces.
+ *
+ * Returns RGBA pixel data (free with free()) or NULL on failure.
+ * *out_width / *out_height are per-frame dimensions.
+ * *out_frames is the frame count.
+ * *out_delays is malloc'd array of per-frame delays in ms (free with free()).
+ */
+static unsigned char* load_apng(const unsigned char* file_data, size_t file_len,
+                                int* out_width, int* out_height,
+                                int* out_frames, int** out_delays)
+{
+        apng_crc32_init();
+
+        if (file_len < 8 + 25 || memcmp(file_data, png_signature, 8) != 0) {
+                KROSSHAIR_LOG("[APNG] not a PNG file\n");
+                return NULL;
+        }
+
+        /* parse IHDR */
+        size_t pos = 8;
+        uint32_t chunk_len = apng_read_be32(file_data + pos);
+        if (memcmp(file_data + pos + 4, "IHDR", 4) != 0 || chunk_len != 13) {
+                KROSSHAIR_LOG("[APNG] missing IHDR\n");
+                return NULL;
+        }
+        const unsigned char* ihdr_data = file_data + pos + 8;
+        uint32_t canvas_w = apng_read_be32(ihdr_data);
+        uint32_t canvas_h = apng_read_be32(ihdr_data + 4);
+
+        /* first pass: find acTL and count frames */
+        uint32_t num_frames = 0;
+        int found_actl = 0;
+        size_t scan = 8;
+        while (scan + 12 <= file_len) {
+                uint32_t clen = apng_read_be32(file_data + scan);
+                const unsigned char* ctype = file_data + scan + 4;
+                if (scan + 12 + clen > file_len) break;
+                if (memcmp(ctype, "acTL", 4) == 0 && clen >= 8) {
+                        num_frames = apng_read_be32(file_data + scan + 8);
+                        found_actl = 1;
+                }
+                if (memcmp(ctype, "IEND", 4) == 0) break;
+                scan += 12 + clen;
+        }
+
+        if (!found_actl || num_frames < 1) {
+                KROSSHAIR_LOG("[APNG] no acTL chunk or 0 frames (not an APNG)\n");
+                return NULL;
+        }
+
+        /* allocate frame info array */
+        apng_frame_info_t* frames = calloc(num_frames, sizeof(apng_frame_info_t));
+        if (!frames) return NULL;
+
+        /* second pass: collect fcTL + IDAT/fdAT data per frame */
+        int current_frame = -1; /* index into frames[] */
+        int first_frame_is_default = 0; /* fcTL before first IDAT? */
+        int seen_idat = 0;
+
+        pos = 8;
+        while (pos + 12 <= file_len) {
+                uint32_t clen = apng_read_be32(file_data + pos);
+                const unsigned char* ctype = file_data + pos + 4;
+                const unsigned char* cdata = file_data + pos + 8;
+                if (pos + 12 + clen > file_len) break;
+
+                if (memcmp(ctype, "fcTL", 4) == 0 && clen >= 26) {
+                        current_frame++;
+                        if (current_frame >= (int)num_frames) break;
+
+                        if (!seen_idat && current_frame == 0)
+                                first_frame_is_default = 1;
+
+                        apng_frame_info_t* f = &frames[current_frame];
+                        f->width     = apng_read_be32(cdata + 4);
+                        f->height    = apng_read_be32(cdata + 8);
+                        f->x_offset  = apng_read_be32(cdata + 12);
+                        f->y_offset  = apng_read_be32(cdata + 16);
+                        f->delay_num = apng_read_be16(cdata + 20);
+                        f->delay_den = apng_read_be16(cdata + 22);
+                        f->dispose_op = cdata[24];
+                        f->blend_op   = cdata[25];
+                } else if (memcmp(ctype, "IDAT", 4) == 0) {
+                        seen_idat = 1;
+                        if (first_frame_is_default && current_frame == 0) {
+                                apng_frame_append_idat(&frames[0], cdata, clen);
+                        }
+                } else if (memcmp(ctype, "fdAT", 4) == 0 && clen > 4) {
+                        /* fdAT: first 4 bytes are sequence number, rest is
+                         * IDAT-equivalent data */
+                        if (current_frame >= 0 && current_frame < (int)num_frames) {
+                                apng_frame_append_idat(&frames[current_frame],
+                                                       cdata + 4, clen - 4);
+                        }
+                } else if (memcmp(ctype, "IEND", 4) == 0) {
+                        break;
+                }
+
+                pos += 12 + clen;
+        }
+
+        /* the actual number of frames we collected may be less than num_frames
+         * (e.g., truncated file) */
+        int actual_frames = current_frame + 1;
+        if (actual_frames < 1) {
+                KROSSHAIR_LOG("[APNG] no frames found\n");
+                for (uint32_t i = 0; i < num_frames; i++)
+                        free(frames[i].idat_data);
+                free(frames);
+                return NULL;
+        }
+        if (actual_frames < (int)num_frames) {
+                KROSSHAIR_LOG("[APNG] warning: expected %u frames but found %d\n",
+                              num_frames, actual_frames);
+        }
+
+        /* build vertical atlas: each row is canvas_w x canvas_h */
+        size_t frame_stride = (size_t)canvas_w * canvas_h * 4;
+        unsigned char* atlas = calloc(actual_frames, frame_stride);
+        int* delays = malloc(sizeof(int) * actual_frames);
+        unsigned char* canvas = calloc(1, frame_stride);
+        unsigned char* prev_canvas = NULL; /* for dispose_op = APNG_DISPOSE_OP_PREVIOUS */
+        if (!atlas || !delays || !canvas) {
+                free(atlas);
+                free(delays);
+                free(canvas);
+                for (uint32_t i = 0; i < num_frames; i++)
+                        free(frames[i].idat_data);
+                free(frames);
+                return NULL;
+        }
+
+        for (int i = 0; i < actual_frames; i++) {
+                apng_frame_info_t* f = &frames[i];
+
+                /* compute delay in ms */
+                uint16_t den = f->delay_den ? f->delay_den : 100;
+                int delay_ms = (int)((uint32_t)f->delay_num * 1000 / den);
+                if (delay_ms <= 0) delay_ms = 100;
+                delays[i] = delay_ms;
+
+                /* save canvas for APNG_DISPOSE_OP_PREVIOUS before compositing */
+                if (f->dispose_op == 2) { /* APNG_DISPOSE_OP_PREVIOUS */
+                        if (!prev_canvas) prev_canvas = malloc(frame_stride);
+                        if (prev_canvas) memcpy(prev_canvas, canvas, frame_stride);
+                }
+
+                /* decode this frame's pixels */
+                if (f->idat_size == 0) {
+                        KROSSHAIR_LOG("[APNG] frame %d has no image data, skipping\n", i);
+                        memcpy(atlas + i * frame_stride, canvas, frame_stride);
+                        continue;
+                }
+
+                int fw, fh;
+                stbi_uc* fpix = apng_decode_frame(f, ihdr_data, &fw, &fh);
+                if (!fpix) {
+                        KROSSHAIR_LOG("[APNG] failed to decode frame %d\n", i);
+                        memcpy(atlas + i * frame_stride, canvas, frame_stride);
+                        continue;
+                }
+
+                /* apply blend_op */
+                if (f->blend_op == 0) { /* APNG_BLEND_OP_SOURCE */
+                        apng_blend_source(canvas, fpix, canvas_w, canvas_h,
+                                          f->x_offset, f->y_offset,
+                                          f->width, f->height);
+                } else { /* APNG_BLEND_OP_OVER */
+                        apng_blend_over(canvas, fpix, canvas_w, canvas_h,
+                                        f->x_offset, f->y_offset,
+                                        f->width, f->height);
+                }
+                stbi_image_free(fpix);
+
+                /* copy composited canvas to atlas row */
+                memcpy(atlas + i * frame_stride, canvas, frame_stride);
+
+                /* apply dispose_op (affects canvas for NEXT frame) */
+                if (f->dispose_op == 1) { /* APNG_DISPOSE_OP_BACKGROUND */
+                        apng_clear_region(canvas, canvas_w, canvas_h,
+                                          f->x_offset, f->y_offset,
+                                          f->width, f->height);
+                } else if (f->dispose_op == 2) { /* APNG_DISPOSE_OP_PREVIOUS */
+                        if (prev_canvas) memcpy(canvas, prev_canvas, frame_stride);
+                }
+                /* dispose_op 0 (APNG_DISPOSE_OP_NONE): leave canvas as-is */
+        }
+
+        free(canvas);
+        free(prev_canvas);
+        for (uint32_t i = 0; i < num_frames; i++)
+                free(frames[i].idat_data);
+        free(frames);
+
+        *out_width  = (int)canvas_w;
+        *out_height = (int)canvas_h;
+        *out_frames = actual_frames;
+        *out_delays = delays;
+
+        KROSSHAIR_LOG("[APNG] decoded %d frames, canvas %ux%u\n",
+                      actual_frames, canvas_w, canvas_h);
+
+        return atlas;
+}
+
+/* ────────────────── end APNG loader ─────────────────── */
 
 static void ensure_swapchain_crosshair(swapchain_data_t* data,
                                        VkCommandBuffer cmd_buffer)
@@ -915,9 +1475,189 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
         stbi_uc* pixels;
 
         if (using_file) {
-                pixels = stbi_load(crosshair_path, &tex_width, &tex_height,
-                                   &tex_channels, STBI_rgb_alpha);
-                image_size = tex_width * tex_height * 4;
+                const char* ext = strrchr(crosshair_path, '.');
+                int is_gif = ext && (strcasecmp(ext, ".gif") == 0);
+                int is_apng = ext && (strcasecmp(ext, ".apng") == 0);
+
+                /* .png files might also be APNG -- detect by checking for
+                 * acTL chunk if the extension is .png */
+                int is_png = ext && (strcasecmp(ext, ".png") == 0);
+
+                if (is_gif) {
+                        FILE* f = fopen(crosshair_path, "rb");
+                        if (!f) {
+                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to open GIF: %s\n",
+                                              crosshair_path);
+                                free(crosshair_path);
+                                return;
+                        }
+
+                        fseek(f, 0, SEEK_END);
+                        long file_len = ftell(f);
+                        fseek(f, 0, SEEK_SET);
+
+                        if (file_len <= 0 || file_len > (long)INT_MAX) {
+                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] invalid GIF file size: %ld\n",
+                                              file_len);
+                                fclose(f);
+                                free(crosshair_path);
+                                return;
+                        }
+
+                        unsigned char* file_buf = malloc((size_t)file_len);
+                        if (!file_buf) {
+                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to allocate GIF read buffer\n");
+                                fclose(f);
+                                free(crosshair_path);
+                                return;
+                        }
+
+                        size_t bytes_read = fread(file_buf, 1, (size_t)file_len, f);
+                        fclose(f);
+
+                        if ((long)bytes_read != file_len) {
+                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] short read on GIF: %zu/%ld\n",
+                                              bytes_read, file_len);
+                                free(file_buf);
+                                free(crosshair_path);
+                                return;
+                        }
+
+                        int* delays = NULL;
+                        int frames = 0;
+                        int gif_len = (int)file_len;
+                        stbi_uc* gif_data = stbi_load_gif_from_memory(
+                            file_buf, gif_len, &delays, &tex_width, &tex_height,
+                            &frames, &tex_channels, STBI_rgb_alpha);
+                        free(file_buf);
+
+                        if (!gif_data || frames < 1) {
+                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to decode GIF: %s (%s)\n",
+                                              crosshair_path,
+                                              gif_data ? "no frames" : "decode error");
+                                if (gif_data) stbi_image_free(gif_data);
+                                if (delays) free(delays);
+                                free(crosshair_path);
+                                return;
+                        }
+
+                        /*
+                         * Build a vertical texture atlas: all frames stacked
+                         * top-to-bottom in a single image.  The UV coordinates
+                         * are adjusted per-frame to select the right slice.
+                         *
+                         * gif_data from stbi is already laid out as
+                         * [frame0][frame1]...[frameN] contiguously, each
+                         * frame being (tex_width * tex_height * 4) bytes,
+                         * which is exactly the atlas layout we need.
+                         */
+                        int frame_height = tex_height;
+                        int atlas_height = tex_height * frames;
+                        image_size = (VkDeviceSize)tex_width * atlas_height * 4;
+                        pixels = gif_data;
+                        /* tex_height now refers to the full atlas */
+                        tex_height = atlas_height;
+
+                        /* store animation state */
+                        data->gif_frame_count  = frames;
+                        data->gif_frame_height = frame_height;
+                        data->gif_current_frame = 0;
+                        clock_gettime(CLOCK_MONOTONIC, &data->gif_last_frame_time);
+
+                        if (delays) {
+                                data->gif_delays = malloc(sizeof(int) * frames);
+                                for (int gi = 0; gi < frames; gi++) {
+                                        /* stbi already converts GIF centisecond
+                                         * delays to milliseconds internally
+                                         * (10 * cs).  delay 0 means "as fast
+                                         * as possible", default to ~100ms */
+                                        data->gif_delays[gi] =
+                                            delays[gi] > 0 ? delays[gi] : 100;
+                                }
+                                free(delays);
+                        } else {
+                                data->gif_delays = malloc(sizeof(int) * frames);
+                                for (int gi = 0; gi < frames; gi++)
+                                        data->gif_delays[gi] = 100;
+                        }
+
+                        KROSSHAIR_LOG("[KROSSHAIR] loaded GIF atlas: %dx%d (%d frames, frame_h=%d)\n",
+                                      tex_width, atlas_height, frames, frame_height);
+                } else if (is_apng || is_png) {
+                        /* try to load as APNG; if it's a plain PNG the
+                         * loader will return NULL (no acTL) and we fall
+                         * through to stbi_load below */
+                        FILE* f = fopen(crosshair_path, "rb");
+                        if (!f) {
+                                KROSSHAIR_LOG("[KROSSHAIR_ERROR] failed to open: %s\n",
+                                              crosshair_path);
+                                free(crosshair_path);
+                                return;
+                        }
+
+                        fseek(f, 0, SEEK_END);
+                        long file_len = ftell(f);
+                        fseek(f, 0, SEEK_SET);
+
+                        unsigned char* file_buf = NULL;
+                        if (file_len > 0 && file_len <= (long)INT_MAX) {
+                                file_buf = malloc((size_t)file_len);
+                                if (file_buf) {
+                                        size_t bytes_read = fread(file_buf, 1, (size_t)file_len, f);
+                                        if ((long)bytes_read != file_len) {
+                                                free(file_buf);
+                                                file_buf = NULL;
+                                        }
+                                }
+                        }
+                        fclose(f);
+
+                        int* apng_delays = NULL;
+                        int apng_frames = 0;
+                        int apng_w = 0, apng_h = 0;
+                        unsigned char* apng_data = NULL;
+
+                        if (file_buf) {
+                                apng_data = load_apng((const unsigned char*)file_buf,
+                                                      (size_t)file_len, &apng_w, &apng_h,
+                                                      &apng_frames, &apng_delays);
+                                free(file_buf);
+                        }
+
+                        if (apng_data && apng_frames > 1) {
+                                /* animated APNG -- same atlas approach as GIF */
+                                tex_width = apng_w;
+                                int frame_height = apng_h;
+                                int atlas_height = apng_h * apng_frames;
+                                tex_height = atlas_height;
+                                image_size = (VkDeviceSize)tex_width * atlas_height * 4;
+                                pixels = (stbi_uc*)apng_data;
+
+                                data->gif_frame_count   = apng_frames;
+                                data->gif_frame_height  = frame_height;
+                                data->gif_current_frame = 0;
+                                clock_gettime(CLOCK_MONOTONIC, &data->gif_last_frame_time);
+
+                                data->gif_delays = apng_delays;
+
+                                KROSSHAIR_LOG("[KROSSHAIR] loaded APNG atlas: %dx%d (%d frames, frame_h=%d)\n",
+                                              tex_width, atlas_height, apng_frames, frame_height);
+                        } else {
+                                /* not animated APNG (or single frame) --
+                                 * fall back to regular stbi_load for
+                                 * proper PNG handling */
+                                if (apng_data) free(apng_data);
+                                if (apng_delays) free(apng_delays);
+
+                                pixels = stbi_load(crosshair_path, &tex_width, &tex_height,
+                                                   &tex_channels, STBI_rgb_alpha);
+                                image_size = tex_width * tex_height * 4;
+                        }
+                } else {
+                        pixels = stbi_load(crosshair_path, &tex_width, &tex_height,
+                                           &tex_channels, STBI_rgb_alpha);
+                        image_size = tex_width * tex_height * 4;
+                }
 
                 if (!pixels) {
                         printf(
@@ -962,8 +1702,20 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
                     &data->crosshair_upload_buffer_mem, data->crosshair_image);
         }
 
-        setup_vertices((float)data->width, (float)data->height,
-                       (float)tex_height, (float)tex_width, 1.0f);
+        data->crosshair_tex_width = tex_width;
+
+        if (data->gif_frame_count > 1) {
+                /* for GIF, use frame dimensions for quad size,
+                 * UV selects first frame from atlas */
+                float uv_step = 1.0f / (float)data->gif_frame_count;
+                setup_vertices_uv((float)data->width, (float)data->height,
+                                  (float)data->gif_frame_height,
+                                  (float)tex_width, 1.0f,
+                                  0.0f, uv_step);
+        } else {
+                setup_vertices((float)data->width, (float)data->height,
+                               (float)tex_height, (float)tex_width, 1.0f);
+        }
 
         data->crosshair_uploaded = 1;
 }
@@ -977,12 +1729,24 @@ static void create_draw(swapchain_data_t* data)
         krosshair_draw_t* draw     = data->draw;
 
         if (draw) {
-                if (device_data->vtable.GetFenceStatus(
-                        device_data->device, draw->fence) == VK_SUCCESS) {
+                VkResult fence_status = device_data->vtable.GetFenceStatus(
+                    device_data->device, draw->fence);
+                if (fence_status == VK_SUCCESS) {
                         VK_CHECK(device_data->vtable.ResetFences(
                             device_data->device, 1, &draw->fence));
                         return;
                 }
+                if (fence_status == VK_NOT_READY) {
+                        VkResult wait_result = device_data->vtable.WaitForFences(
+                            device_data->device, 1, &draw->fence, VK_TRUE, 100000000);
+                        if (wait_result == VK_SUCCESS) {
+                                VK_CHECK(device_data->vtable.ResetFences(
+                                    device_data->device, 1, &draw->fence));
+                                return;
+                        }
+                }
+                destroy_draw(data, draw);
+                data->draw = NULL;
         }
 
         VkSemaphoreCreateInfo sem_info = {};
@@ -1015,6 +1779,44 @@ static void create_draw(swapchain_data_t* data)
         data->draw = draw;
 }
 
+static void destroy_draw(swapchain_data_t* data, krosshair_draw_t* draw)
+{
+        if (!draw) return;
+
+        device_data_t* device_data = data->device_data;
+
+        if (draw->vertex_buffer != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyBuffer(device_data->device,
+                                                  draw->vertex_buffer, NULL);
+        }
+        if (draw->vertex_buffer_mem != VK_NULL_HANDLE) {
+                device_data->vtable.FreeMemory(device_data->device,
+                                               draw->vertex_buffer_mem, NULL);
+        }
+        if (draw->index_buffer != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyBuffer(device_data->device,
+                                                  draw->index_buffer, NULL);
+        }
+        if (draw->index_buffer_mem != VK_NULL_HANDLE) {
+                device_data->vtable.FreeMemory(device_data->device,
+                                               draw->index_buffer_mem, NULL);
+        }
+        if (draw->semaphore != VK_NULL_HANDLE) {
+                device_data->vtable.DestroySemaphore(device_data->device,
+                                                     draw->semaphore, NULL);
+        }
+        if (draw->crossengine_semaphore != VK_NULL_HANDLE) {
+                device_data->vtable.DestroySemaphore(device_data->device,
+                                                     draw->crossengine_semaphore, NULL);
+        }
+        if (draw->fence != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyFence(device_data->device,
+                                                draw->fence, NULL);
+        }
+
+        free(draw);
+}
+
 static krosshair_draw_t* render_swapchain_display(
     swapchain_data_t* data, queue_data_t* present_queue,
     const VkSemaphore* wait_semaphores, unsigned n_wait_semaphores,
@@ -1024,6 +1826,10 @@ static krosshair_draw_t* render_swapchain_display(
 
         create_draw(data);
         krosshair_draw_t* draw = data->draw;
+        if (!draw) {
+                KROSSHAIR_LOG("[KROSSHAIR] create_draw failed, no draw available\n");
+                return NULL;
+        }
         device_data->vtable.ResetCommandBuffer(draw->cmd_buffer, 0);
 
         VkRenderPassBeginInfo render_pass_info = {};
@@ -1062,10 +1868,55 @@ static krosshair_draw_t* render_swapchain_display(
         device_data->vtable.CmdBeginRenderPass(
             draw->cmd_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
 
-        // create vertex & index buffers
-        // since our contents aren't changing at runtime, might as well do
-        // creation and upload only once somewhere else? upload vertex & index
-        // data bind vertex & index buffers
+        /* advance animation frame if needed (GIF or APNG) */
+        if (data->gif_frame_count > 1 && data->gif_delays) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+
+                long elapsed_ms =
+                    (now.tv_sec - data->gif_last_frame_time.tv_sec) * 1000 +
+                    (now.tv_nsec - data->gif_last_frame_time.tv_nsec) / 1000000;
+
+                int advanced = 0;
+                int delay = data->gif_delays[data->gif_current_frame];
+
+                /* consume all elapsed time, advancing multiple frames if
+                 * the present rate is lower than the animation rate */
+                while (elapsed_ms >= delay) {
+                        /* accumulate: add delay to last_frame_time instead
+                         * of resetting to now, so leftover time carries
+                         * over and the animation stays in sync */
+                        data->gif_last_frame_time.tv_nsec += (long)delay * 1000000L;
+                        while (data->gif_last_frame_time.tv_nsec >= 1000000000L) {
+                                data->gif_last_frame_time.tv_sec++;
+                                data->gif_last_frame_time.tv_nsec -= 1000000000L;
+                        }
+
+                        data->gif_current_frame =
+                            (data->gif_current_frame + 1) % data->gif_frame_count;
+                        delay = data->gif_delays[data->gif_current_frame];
+                        advanced = 1;
+
+                        /* recalculate elapsed from updated base */
+                        elapsed_ms =
+                            (now.tv_sec - data->gif_last_frame_time.tv_sec) * 1000 +
+                            (now.tv_nsec - data->gif_last_frame_time.tv_nsec) / 1000000;
+                }
+
+                if (advanced) {
+                        float uv_step = 1.0f / (float)data->gif_frame_count;
+                        float uv_top  = uv_step * (float)data->gif_current_frame;
+                        float uv_bot  = uv_top + uv_step;
+                        setup_vertices_uv(
+                            (float)data->width, (float)data->height,
+                            (float)data->gif_frame_height,
+                            (float)data->crosshair_tex_width, 1.0f,
+                            uv_top, uv_bot);
+
+                        /* force vertex buffer re-upload with new UVs */
+                        draw->vertex_buffer_initialized = 0;
+                }
+        }
 
         size_t vertex_size = sizeof(vertices);
         size_t index_size  = sizeof(indices);
@@ -1074,45 +1925,51 @@ static krosshair_draw_t* render_swapchain_display(
                                         &draw->vertex_buffer_mem,
                                         &draw->vertex_buffer_size, vertex_size,
                                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+                draw->vertex_buffer_initialized = 0;
         }
         if (draw->index_buffer_size < index_size) {
                 create_or_resize_buffer(device_data, &draw->index_buffer,
                                         &draw->index_buffer_mem,
                                         &draw->index_buffer_size, index_size,
                                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                draw->index_buffer_initialized = 0;
         }
 
-        // upload vertex buffer
-        void* vtx_dst = NULL;
-        VK_CHECK(device_data->vtable.MapMemory(
-            device_data->device, draw->vertex_buffer_mem, 0,
-            draw->vertex_buffer_size, 0, &vtx_dst));
-        memcpy(vtx_dst, vertices, (size_t)draw->vertex_buffer_size);
+        if (!draw->vertex_buffer_initialized) {
+                void* vtx_dst = NULL;
+                VK_CHECK(device_data->vtable.MapMemory(
+                    device_data->device, draw->vertex_buffer_mem, 0,
+                    draw->vertex_buffer_size, 0, &vtx_dst));
+                memcpy(vtx_dst, vertices, sizeof(vertices));
 
-        VkMappedMemoryRange vtx_range = {};
-        vtx_range.sType               = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        vtx_range.memory              = draw->vertex_buffer_mem;
-        vtx_range.size                = VK_WHOLE_SIZE;
-        VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
-            device_data->device, 1, &vtx_range));
-        device_data->vtable.UnmapMemory(device_data->device,
-                                        draw->vertex_buffer_mem);
+                VkMappedMemoryRange vtx_range = {};
+                vtx_range.sType               = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                vtx_range.memory              = draw->vertex_buffer_mem;
+                vtx_range.size                = VK_WHOLE_SIZE;
+                VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
+                    device_data->device, 1, &vtx_range));
+                device_data->vtable.UnmapMemory(device_data->device,
+                                                draw->vertex_buffer_mem);
+                draw->vertex_buffer_initialized = 1;
+        }
 
-        // upload index buffer
-        void* idx_dst = NULL;
-        VK_CHECK(device_data->vtable.MapMemory(
-            device_data->device, draw->index_buffer_mem, 0,
-            draw->index_buffer_size, 0, &idx_dst));
-        memcpy(idx_dst, indices, (size_t)draw->index_buffer_size);
+        if (!draw->index_buffer_initialized) {
+                void* idx_dst = NULL;
+                VK_CHECK(device_data->vtable.MapMemory(
+                    device_data->device, draw->index_buffer_mem, 0,
+                    draw->index_buffer_size, 0, &idx_dst));
+                memcpy(idx_dst, indices, sizeof(indices));
 
-        VkMappedMemoryRange idx_range = {};
-        idx_range.sType               = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        idx_range.memory              = draw->index_buffer_mem;
-        idx_range.size                = VK_WHOLE_SIZE;
-        VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
-            device_data->device, 1, &idx_range));
-        device_data->vtable.UnmapMemory(device_data->device,
-                                        draw->index_buffer_mem);
+                VkMappedMemoryRange idx_range = {};
+                idx_range.sType               = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                idx_range.memory              = draw->index_buffer_mem;
+                idx_range.size                = VK_WHOLE_SIZE;
+                VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
+                    device_data->device, 1, &idx_range));
+                device_data->vtable.UnmapMemory(device_data->device,
+                                                draw->index_buffer_mem);
+                draw->index_buffer_initialized = 1;
+        }
 
         device_data->vtable.CmdBindPipeline(
             draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, data->pipeline);
@@ -1142,8 +1999,9 @@ static krosshair_draw_t* render_swapchain_display(
         device_data->vtable.CmdBindDescriptorSets(
             draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
             data->pipeline_layout, 0, 1, &data->descriptor_set, 0, NULL);
-        device_data->vtable.CmdDrawIndexed(draw->cmd_buffer, sizeof(indices), 1,
-                                           0, 0, 0);
+        device_data->vtable.CmdDrawIndexed(draw->cmd_buffer,
+                                            sizeof(indices) / sizeof(indices[0]),
+                                            1, 0, 0, 0);
 
         device_data->vtable.CmdEndRenderPass(draw->cmd_buffer);
 
@@ -1174,13 +2032,18 @@ static krosshair_draw_t* render_swapchain_display(
                     &imb);
         }
 
-        device_data->vtable.EndCommandBuffer(draw->cmd_buffer);
+        VkResult end_result = device_data->vtable.EndCommandBuffer(draw->cmd_buffer);
+        if (end_result != VK_SUCCESS) {
+                KROSSHAIR_LOG("[KROSSHAIR] EndCommandBuffer failed: %d\n", end_result);
+                return NULL;
+        }
 
         /* when presenting on a different queue than where we're drawing the
          * crosshair *AND* when the application does not provide a semaphore to
          * vkQueuePresent, insert our own cross-engine synchronization
          * semaphore.
          * */
+        VkResult submit_result = VK_SUCCESS;
         if (n_wait_semaphores == 0 &&
             device_data->graphic_queue->queue != present_queue->queue) {
                 VkPipelineStageFlags stages_wait =
@@ -1193,8 +2056,13 @@ static krosshair_draw_t* render_swapchain_display(
                 submit_info.signalSemaphoreCount = 1;
                 submit_info.pSignalSemaphores    = &draw->crossengine_semaphore;
 
-                device_data->vtable.QueueSubmit(present_queue->queue, 1,
-                                                &submit_info, VK_NULL_HANDLE);
+                submit_result = device_data->vtable.QueueSubmit(
+                    present_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+                if (submit_result != VK_SUCCESS) {
+                        KROSSHAIR_LOG("[KROSSHAIR] crossengine QueueSubmit failed: %d\n",
+                                      submit_result);
+                        return NULL;
+                }
 
                 submit_info.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 submit_info.commandBufferCount = 1;
@@ -1205,16 +2073,21 @@ static krosshair_draw_t* render_swapchain_display(
                 submit_info.signalSemaphoreCount = 1;
                 submit_info.pSignalSemaphores    = &draw->semaphore;
 
-                device_data->vtable.QueueSubmit(
+                submit_result = device_data->vtable.QueueSubmit(
                     device_data->graphic_queue->queue, 1, &submit_info,
                     draw->fence);
+                if (submit_result != VK_SUCCESS) {
+                        KROSSHAIR_LOG("[KROSSHAIR] graphic QueueSubmit failed: %d\n",
+                                      submit_result);
+                        return NULL;
+                }
         } else {
                 /* wait in the fragment stage until the swapchain image is ready
                  */
                 VkPipelineStageFlags* stages_wait =
-                    malloc(sizeof(*stages_wait) * n_wait_semaphores);
-                memset(stages_wait, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                       sizeof(*stages_wait) * n_wait_semaphores);
+                    malloc(sizeof(*stages_wait) * (n_wait_semaphores ? n_wait_semaphores : 1));
+                for (unsigned s = 0; s < n_wait_semaphores; s++)
+                        stages_wait[s] = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
                 VkSubmitInfo submit_info       = {};
                 submit_info.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1226,10 +2099,15 @@ static krosshair_draw_t* render_swapchain_display(
                 submit_info.signalSemaphoreCount = 1;
                 submit_info.pSignalSemaphores    = &draw->semaphore;
 
-                device_data->vtable.QueueSubmit(
+                submit_result = device_data->vtable.QueueSubmit(
                     device_data->graphic_queue->queue, 1, &submit_info,
                     draw->fence);
                 free(stages_wait);
+                if (submit_result != VK_SUCCESS) {
+                        KROSSHAIR_LOG("[KROSSHAIR] QueueSubmit failed: %d (wait_sems=%u)\n",
+                                      submit_result, n_wait_semaphores);
+                        return NULL;
+                }
         }
 
         return draw;
@@ -1482,6 +2360,7 @@ static void setup_swapchain_data(swapchain_data_t* data,
 
         VK_CHECK(device_data->vtable.GetSwapchainImagesKHR(
             device_data->device, data->swapchain, &n_images, data->images));
+        data->n_images = n_images;
 
         VkImageViewCreateInfo view_info = {};
         view_info.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -1577,37 +2456,54 @@ static VkResult overlay_CreateSwapchainKHR(
 
         device_data_t* device_data = FIND_OBJ(device_data_t, device);
 
-        VkResult result            = device_data->vtable.CreateSwapchainKHR(
+        /* save reference to old swapchain data - we must NOT destroy it before
+         * the create call because the driver needs oldSwapchain to be valid */
+        swapchain_data_t* old_swapchain_data = NULL;
+        if (pCreateInfo->oldSwapchain != VK_NULL_HANDLE) {
+                old_swapchain_data =
+                    FIND_OBJ(swapchain_data_t, pCreateInfo->oldSwapchain);
+        }
+
+        VkResult result = device_data->vtable.CreateSwapchainKHR(
             device, &create_info, pAllocator, pSwapchain);
         if (result != VK_SUCCESS) return result;
+
+        /* now that the new swapchain is created, clean up the old one's
+         * internal resources (Vulkan retires oldSwapchain automatically) */
+        if (old_swapchain_data) {
+                destroy_swapchain_data(old_swapchain_data);
+                unmap_object(HKEY(old_swapchain_data->swapchain));
+                free(old_swapchain_data);
+        }
 
         swapchain_data_t* swapchain_data =
             new_swapchain_data(*pSwapchain, device_data);
 
         setup_swapchain_data(swapchain_data, pCreateInfo);
 
+        KROSSHAIR_LOG("[KROSSHAIR] CreateSwapchainKHR: created %lu (%ux%u, n_images=%u, old=%lu)\n",
+                      (unsigned long)*pSwapchain, pCreateInfo->imageExtent.width,
+                      pCreateInfo->imageExtent.height, swapchain_data->n_images,
+                      (unsigned long)pCreateInfo->oldSwapchain);
+
         return result;
 }
 
 static void overlay_DestroySwapchainKHR(VkDevice device,
-                                        VkSwapchainKHR* swapchain,
-                                        VkAllocationCallbacks* pAllocator)
+                                        VkSwapchainKHR swapchain,
+                                        const VkAllocationCallbacks* pAllocator)
 {
         device_data_t* device_data = FIND_OBJ(device_data_t, device);
         swapchain_data_t* data     = FIND_OBJ(swapchain_data_t, swapchain);
 
-        for (size_t i = 0; i < data->n_images; i++) {
-                device_data->vtable.DestroyFramebuffer(
-                    device_data->device, data->framebuffers[i], NULL);
-                device_data->vtable.DestroyImageView(
-                    device_data->device, data->image_views[i], NULL);
+        if (data) {
+                destroy_swapchain_data(data);
+                unmap_object(HKEY(data->swapchain));
+                free(data);
         }
 
-        free(data->draw);
-        unmap_object(HKEY(data->swapchain));
         device_data->vtable.DestroySwapchainKHR(device_data->device,
-                                                data->swapchain, NULL);
-        free(data);
+                                                swapchain, pAllocator);
 }
 
 static VkResult overlay_CreateInstance(const VkInstanceCreateInfo* pCreateInfo,
@@ -1833,6 +2729,11 @@ static VkResult overlay_QueuePresentKHR(VkQueue queue,
 {
         queue_data_t* queue_data = FIND_OBJ(queue_data_t, queue);
 
+        if (!queue_data) {
+                KROSSHAIR_LOG("[KROSSHAIR] QueuePresent: queue_data is NULL!\n");
+                return VK_SUCCESS;
+        }
+
         VkResult result          = VK_SUCCESS;
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
                 VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[i];
@@ -1846,9 +2747,14 @@ static VkResult overlay_QueuePresentKHR(VkQueue queue,
                 present_info.pSwapchains      = &swapchain;
                 present_info.pImageIndices    = &image_index;
 
-                krosshair_draw_t* draw        = before_present(
-                    swapchain_data, queue_data, pPresentInfo->pWaitSemaphores,
-                    i == 0 ? pPresentInfo->waitSemaphoreCount : 0, image_index);
+                krosshair_draw_t* draw = NULL;
+                if (swapchain_data) {
+                        draw = before_present(
+                            swapchain_data, queue_data,
+                            pPresentInfo->pWaitSemaphores,
+                            i == 0 ? pPresentInfo->waitSemaphoreCount : 0,
+                            image_index);
+                }
 
                 if (draw) {
                         present_info.pWaitSemaphores    = &draw->semaphore;
@@ -1858,6 +2764,7 @@ static VkResult overlay_QueuePresentKHR(VkQueue queue,
                 VkResult chain_result =
                     queue_data->device->vtable.QueuePresentKHR(queue,
                                                                &present_info);
+
                 if (present_info.pResults) {
                         pPresentInfo->pResults[i] = chain_result;
                 }
@@ -1865,6 +2772,7 @@ static VkResult overlay_QueuePresentKHR(VkQueue queue,
                         result = chain_result;
                 }
         }
+
         return result;
 }
 
