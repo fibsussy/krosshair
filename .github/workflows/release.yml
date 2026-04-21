@@ -182,16 +182,20 @@ jobs:
           cp -r aur /home/builduser/aur
           chown -R builduser:builduser /home/builduser/aur
 
-          sudo -u builduser VERSION="$VERSION" bash -c '
+          sudo -u builduser VERSION="$VERSION" GIT_SSH_COMMAND="ssh -i /home/builduser/.ssh/aur -o StrictHostKeyChecking=no -v" bash -c '
             cd /home/builduser
-            if git clone ssh://aur@aur.archlinux.org/krosshair.git aur-push 2>&1; then
+            echo "Testing SSH connection..."
+            ssh -T aur@aur.archlinux.org 2>&1 || true
+            echo "Attempting to clone AUR repo..."
+            GIT_SSH_COMMAND="ssh -i /home/builduser/.ssh/aur -o StrictHostKeyChecking=no" git clone ssh://aur@aur.archlinux.org/krosshair.git aur-push 2>&1 || true
+            if [ -d "aur-push/.git" ]; then
               echo "Cloned existing AUR repo"
               cd aur-push
               git fetch origin
               git reset --hard origin/master
               cd ..
             else
-              echo "Creating new AUR repo"
+              echo "Creating new AUR repo (clone failed)"
               mkdir -p aur-push
               cd aur-push
               git init
@@ -209,7 +213,7 @@ jobs:
             git config user.email "action@github.com"
             git add PKGBUILD .SRCINFO krosshair.install
             git commit -m "Update to v${VERSION}" || echo "No changes to commit"
-            GIT_SSH_COMMAND="ssh -i /home/builduser/.ssh/aur -o StrictHostKeyChecking=no" git push origin master
+            git push origin master
           '
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
