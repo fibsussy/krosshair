@@ -9,7 +9,7 @@ SOURCES = $(shell find src -type f -name "*.c")
 
 all:
 	mkdir -p lib
-	$(CC) $(LDFLAGS) $(CCFLAGS) $(SOURCES) -o $(LIBRARY)
+	$(CC) $(CCFLAGS) $(SOURCES) $(LDFLAGS) -o $(LIBRARY)
 
 install:
 	sudo mkdir -p /usr/lib/krosshair
