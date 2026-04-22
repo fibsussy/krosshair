@@ -8,11 +8,12 @@ url="https://github.com/fibsussy/krosshair"
 license=('GPL3')
 depends=('vulkan-icd-loader' 'libgl' 'libx11')
 makedepends=('gcc' 'make' 'vulkan-headers')
+install=krosshair.install
 options=('!debug')
 
 build() {
     cd "$startdir"
-    make
+    make release
 }
 
 package() {

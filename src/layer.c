@@ -30,6 +30,9 @@
                  (const struct VkBaseInStructure*)(__start); \
              __iter; __iter = __iter->pNext)
 
+#ifdef NDEBUG
+#define KROSSHAIR_LOG(fmt, ...) ((void)0)
+#else
 #define KROSSHAIR_LOG(fmt, ...) \
         do { \
                 FILE* _kf = fopen("/tmp/krosshair.log", "a"); \
@@ -38,12 +41,13 @@
                         fclose(_kf); \
                 } \
         } while (0)
+#endif
 
 #define VK_CHECK(expr)                        \
         do {                                  \
                 VkResult __result = (expr);   \
                 if (__result != VK_SUCCESS) { \
-                        printf("error\n");    \
+                        KROSSHAIR_LOG("[KROSSHAIR_ERROR] VK_CHECK failed: %d\n", __result); \
                 }                             \
         } while (0)
 
@@ -271,16 +275,16 @@ int vk_map_get(vk_object_map_t* map, uint64_t obj, vk_object_t* obj_out)
 
 void vk_map_print(vk_object_map_t* map)
 {
-        printf(
+        KROSSHAIR_LOG(
             "#################################### [ITERATING MAP] "
             "######################################\n");
         for (size_t i = 0; i < MAX_VK_OBJECTS; i++) {
                 if (map->data[i].obj == 0) continue;
 
-                printf("item %lu (%s) has obj: \t\t %lu, data \t\t %p\n", i,
+                KROSSHAIR_LOG("item %lu (%s) has obj: \t\t %lu, data \t\t %p\n", i,
                        map->data[i].name, map->data[i].obj, map->data[i].data);
         }
-        printf(
+        KROSSHAIR_LOG(
             "##################################################################"
             "####"
             "#####################\n");
@@ -313,26 +317,6 @@ typedef struct queue_data {
         uint32_t family_index;
 } queue_data_t;
 
-typedef struct static_vk_resources {
-        VkSampler crosshair_sampler;
-        VkDescriptorPool descriptor_pool;
-        VkDescriptorSetLayout descriptor_layout;
-        VkPipelineLayout pipeline_layout;
-        VkPipeline pipeline;
-        VkRenderPass render_pass;
-        VkCommandPool cmd_pool;
-        VkSemaphore crossengine_semaphore;
-        VkSemaphore semaphore;
-        VkFence fence;
-        VkBuffer vertex_buffer;
-        VkDeviceMemory vertex_buffer_mem;
-        VkDeviceSize vertex_buffer_size;
-        VkBuffer index_buffer;
-        VkDeviceMemory index_buffer_mem;
-        VkDeviceSize index_buffer_size;
-        int initialized;
-} static_vk_resources_t;
-
 typedef struct device_data {
         device_dispatch_table_t vtable;
         instance_data_t* instance;
@@ -343,7 +327,6 @@ typedef struct device_data {
         struct queue_data* graphic_queue;
         struct queue_data* queues[16];  // 16 should be enough?
         uint32_t queue_count;
-        static_vk_resources_t* vk_resources;
 } device_data_t;
 
 typedef struct command_buffer_data {
@@ -411,45 +394,27 @@ typedef struct swapchain_data {
         /* crosshair texture dimensions (for vertex setup) */
         int crosshair_tex_width;
 
-        /* GIF animation state */
-        int gif_frame_count;
-        int gif_frame_height;       /* height of a single frame */
-        int* gif_delays;            /* delay per frame in ms */
-        int gif_current_frame;
-        struct timespec gif_last_frame_time;
+        /* per-swapchain vertex data (avoids global shared across swapchains) */
+        vertex_t vertices[4];
+
+        /* animation state (GIF / APNG) */
+        int anim_frame_count;
+        int anim_frame_height;       /* height of a single frame */
+        int* anim_delays;            /* delay per frame in ms */
+        int anim_current_frame;
+        struct timespec anim_last_frame_time;
 
         krosshair_draw_t* draw;
 
 } swapchain_data_t;
-
-// TODO: change all of this to be adjustable at runtime
-// const float texture_size_px       = 24.0f;
-// const float screen_width          = 1920.0f;
-// const float screen_height         = 1080.0f;
-//
-// const float width                 = (texture_size_px / screen_width) * 2.0f;
-// const float height                = (texture_size_px / screen_height) * 2.0f;
-//
-// const float tex_height            = 520.0f;
-// const float tex_width             = 520.0f;
-//
-// const float texture_correct_width = width * (tex_height / tex_width);
-
-// vertex_t vertices[]               = {
-//     {{-texture_correct_width, -height}, {0.0f, 0.0f}},
-//     { {texture_correct_width, -height}, {1.0f, 0.0f}},
-//     {  {texture_correct_width, height}, {1.0f, 1.0f}},
-//     { {-texture_correct_width, height}, {0.0f, 1.0f}}
-// };
-//
-vertex_t vertices[4] = {0};
 
 /*
  * Set up the quad vertices for rendering.
  *   uv_top / uv_bottom: vertical UV range (0..1 for full texture,
  *   or a sub-range for atlas frame selection)
  */
-static void setup_vertices_uv(float canvas_width, float canvas_height,
+static void setup_vertices_uv(vertex_t* vertices,
+                               float canvas_width, float canvas_height,
                                float tex_width, float tex_height, float scale,
                                float uv_top, float uv_bottom)
 {
@@ -476,11 +441,12 @@ static void setup_vertices_uv(float canvas_width, float canvas_height,
         vertices[3].tex_pos = (vec2_t){0.0f, uv_bottom};
 }
 
-static void setup_vertices(float canvas_width, float canvas_height,
+static void setup_vertices(vertex_t* vertices,
+                           float canvas_width, float canvas_height,
                            float tex_width, float tex_height, float scale)
 {
-        setup_vertices_uv(canvas_width, canvas_height, tex_width, tex_height,
-                          scale, 0.0f, 1.0f);
+        setup_vertices_uv(vertices, canvas_width, canvas_height, tex_width,
+                          tex_height, scale, 0.0f, 1.0f);
 }
 
 uint16_t indices[] = {0, 1, 2, 2, 3, 0};
@@ -554,8 +520,8 @@ static instance_data_t* new_instance_data(VkInstance instance)
 {
         instance_data_t* instance_data = malloc(sizeof(instance_data_t));
         instance_data->instance        = instance;
-        printf("[*] mapping data->instance obj: %lu data: %p\n",
-               HKEY(instance_data->instance), instance_data);
+        KROSSHAIR_LOG("[*] mapping data->instance obj: %lu data: %p\n",
+               HKEY(instance_data->instance), (void*)instance_data);
         map_object(HKEY(instance_data->instance), instance_data,
                    "instance_data->instance");
         return instance_data;
@@ -567,8 +533,8 @@ static device_data_t* new_device_data(VkDevice device,
         device_data_t* device_data = malloc(sizeof(device_data_t));
         device_data->instance      = instance;
         device_data->device        = device;
-        printf("[*] mapping data->device obj: %lu %p\n",
-               HKEY(device_data->device), device_data);
+        KROSSHAIR_LOG("[*] mapping data->device obj: %lu %p\n",
+               HKEY(device_data->device), (void*)device_data);
         map_object(HKEY(device_data->device), device_data,
                    "device_data->device");
         return device_data;
@@ -582,8 +548,8 @@ static cmd_buffer_data_t* new_cmd_buffer_data(VkCommandBuffer cmd_buffer,
         cmdbuffer_data->device_data       = device_data;
         cmdbuffer_data->cmd_buffer        = cmd_buffer;
         cmdbuffer_data->level             = level;
-        printf("[*] mapping data->cmd_buffer obj: %lu %p\n",
-               HKEY(cmdbuffer_data->cmd_buffer), cmdbuffer_data);
+        KROSSHAIR_LOG("[*] mapping data->cmd_buffer obj: %lu %p\n",
+               HKEY(cmdbuffer_data->cmd_buffer), (void*)cmdbuffer_data);
         map_object(HKEY(cmdbuffer_data->cmd_buffer), cmdbuffer_data,
                    "cmdbuffer_data->cmd_buffer");
         return cmdbuffer_data;
@@ -676,14 +642,14 @@ static void shutdown_krosshair_image(swapchain_data_t* data)
                 data->descriptor_set = VK_NULL_HANDLE;
         }
 
-        /* clean up GIF animation state */
-        if (data->gif_delays) {
-                free(data->gif_delays);
-                data->gif_delays = NULL;
+        /* clean up animation state */
+        if (data->anim_delays) {
+                free(data->anim_delays);
+                data->anim_delays = NULL;
         }
-        data->gif_frame_count    = 0;
-        data->gif_frame_height   = 0;
-        data->gif_current_frame  = 0;
+        data->anim_frame_count    = 0;
+        data->anim_frame_height   = 0;
+        data->anim_current_frame  = 0;
         data->crosshair_tex_width = 0;
 }
 
@@ -1016,7 +982,7 @@ static char* get_crosshair_path(void)
                 return strdup(cm_path);
 
         snprintf(cm_path, sizeof(cm_path),
-                 "%s/.config/crosshair-maker/projects/current.apng", home);
+                 "%s/.config/crosshair-maker/projects/current.gif", home);
         if (stat(cm_path, &st) == 0)
                 return strdup(cm_path);
 
@@ -1559,26 +1525,26 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
                         tex_height = atlas_height;
 
                         /* store animation state */
-                        data->gif_frame_count  = frames;
-                        data->gif_frame_height = frame_height;
-                        data->gif_current_frame = 0;
-                        clock_gettime(CLOCK_MONOTONIC, &data->gif_last_frame_time);
+                        data->anim_frame_count  = frames;
+                        data->anim_frame_height = frame_height;
+                        data->anim_current_frame = 0;
+                        clock_gettime(CLOCK_MONOTONIC, &data->anim_last_frame_time);
 
                         if (delays) {
-                                data->gif_delays = malloc(sizeof(int) * frames);
+                                data->anim_delays = malloc(sizeof(int) * frames);
                                 for (int gi = 0; gi < frames; gi++) {
                                         /* stbi already converts GIF centisecond
                                          * delays to milliseconds internally
                                          * (10 * cs).  delay 0 means "as fast
                                          * as possible", default to ~100ms */
-                                        data->gif_delays[gi] =
+                                        data->anim_delays[gi] =
                                             delays[gi] > 0 ? delays[gi] : 100;
                                 }
                                 free(delays);
                         } else {
-                                data->gif_delays = malloc(sizeof(int) * frames);
+                                data->anim_delays = malloc(sizeof(int) * frames);
                                 for (int gi = 0; gi < frames; gi++)
-                                        data->gif_delays[gi] = 100;
+                                        data->anim_delays[gi] = 100;
                         }
 
                         KROSSHAIR_LOG("[KROSSHAIR] loaded GIF atlas: %dx%d (%d frames, frame_h=%d)\n",
@@ -1633,12 +1599,12 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
                                 image_size = (VkDeviceSize)tex_width * atlas_height * 4;
                                 pixels = (stbi_uc*)apng_data;
 
-                                data->gif_frame_count   = apng_frames;
-                                data->gif_frame_height  = frame_height;
-                                data->gif_current_frame = 0;
-                                clock_gettime(CLOCK_MONOTONIC, &data->gif_last_frame_time);
+                                data->anim_frame_count   = apng_frames;
+                                data->anim_frame_height  = frame_height;
+                                data->anim_current_frame = 0;
+                                clock_gettime(CLOCK_MONOTONIC, &data->anim_last_frame_time);
 
-                                data->gif_delays = apng_delays;
+                                data->anim_delays = apng_delays;
 
                                 KROSSHAIR_LOG("[KROSSHAIR] loaded APNG atlas: %dx%d (%d frames, frame_h=%d)\n",
                                               tex_width, atlas_height, apng_frames, frame_height);
@@ -1660,7 +1626,7 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
                 }
 
                 if (!pixels) {
-                        printf(
+                        KROSSHAIR_LOG(
                             "[KROSSHAIR_ERROR] failed to load crosshair "
                             "image.\n");
                         free(crosshair_path);
@@ -1704,16 +1670,18 @@ static void ensure_swapchain_crosshair(swapchain_data_t* data,
 
         data->crosshair_tex_width = tex_width;
 
-        if (data->gif_frame_count > 1) {
-                /* for GIF, use frame dimensions for quad size,
+        if (data->anim_frame_count > 1) {
+                /* for animated crosshairs, use frame dimensions for quad size,
                  * UV selects first frame from atlas */
-                float uv_step = 1.0f / (float)data->gif_frame_count;
-                setup_vertices_uv((float)data->width, (float)data->height,
-                                  (float)data->gif_frame_height,
+                float uv_step = 1.0f / (float)data->anim_frame_count;
+                setup_vertices_uv(data->vertices,
+                                  (float)data->width, (float)data->height,
+                                  (float)data->anim_frame_height,
                                   (float)tex_width, 1.0f,
                                   0.0f, uv_step);
         } else {
-                setup_vertices((float)data->width, (float)data->height,
+                setup_vertices(data->vertices,
+                               (float)data->width, (float)data->height,
                                (float)tex_height, (float)tex_width, 1.0f);
         }
 
@@ -1869,16 +1837,16 @@ static krosshair_draw_t* render_swapchain_display(
             draw->cmd_buffer, &render_pass_info, VK_SUBPASS_CONTENTS_INLINE);
 
         /* advance animation frame if needed (GIF or APNG) */
-        if (data->gif_frame_count > 1 && data->gif_delays) {
+        if (data->anim_frame_count > 1 && data->anim_delays) {
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
 
                 long elapsed_ms =
-                    (now.tv_sec - data->gif_last_frame_time.tv_sec) * 1000 +
-                    (now.tv_nsec - data->gif_last_frame_time.tv_nsec) / 1000000;
+                    (now.tv_sec - data->anim_last_frame_time.tv_sec) * 1000 +
+                    (now.tv_nsec - data->anim_last_frame_time.tv_nsec) / 1000000;
 
                 int advanced = 0;
-                int delay = data->gif_delays[data->gif_current_frame];
+                int delay = data->anim_delays[data->anim_current_frame];
 
                 /* consume all elapsed time, advancing multiple frames if
                  * the present rate is lower than the animation rate */
@@ -1886,30 +1854,31 @@ static krosshair_draw_t* render_swapchain_display(
                         /* accumulate: add delay to last_frame_time instead
                          * of resetting to now, so leftover time carries
                          * over and the animation stays in sync */
-                        data->gif_last_frame_time.tv_nsec += (long)delay * 1000000L;
-                        while (data->gif_last_frame_time.tv_nsec >= 1000000000L) {
-                                data->gif_last_frame_time.tv_sec++;
-                                data->gif_last_frame_time.tv_nsec -= 1000000000L;
+                        data->anim_last_frame_time.tv_nsec += (long)delay * 1000000L;
+                        while (data->anim_last_frame_time.tv_nsec >= 1000000000L) {
+                                data->anim_last_frame_time.tv_sec++;
+                                data->anim_last_frame_time.tv_nsec -= 1000000000L;
                         }
 
-                        data->gif_current_frame =
-                            (data->gif_current_frame + 1) % data->gif_frame_count;
-                        delay = data->gif_delays[data->gif_current_frame];
+                        data->anim_current_frame =
+                            (data->anim_current_frame + 1) % data->anim_frame_count;
+                        delay = data->anim_delays[data->anim_current_frame];
                         advanced = 1;
 
                         /* recalculate elapsed from updated base */
                         elapsed_ms =
-                            (now.tv_sec - data->gif_last_frame_time.tv_sec) * 1000 +
-                            (now.tv_nsec - data->gif_last_frame_time.tv_nsec) / 1000000;
+                            (now.tv_sec - data->anim_last_frame_time.tv_sec) * 1000 +
+                            (now.tv_nsec - data->anim_last_frame_time.tv_nsec) / 1000000;
                 }
 
                 if (advanced) {
-                        float uv_step = 1.0f / (float)data->gif_frame_count;
-                        float uv_top  = uv_step * (float)data->gif_current_frame;
+                        float uv_step = 1.0f / (float)data->anim_frame_count;
+                        float uv_top  = uv_step * (float)data->anim_current_frame;
                         float uv_bot  = uv_top + uv_step;
                         setup_vertices_uv(
+                            data->vertices,
                             (float)data->width, (float)data->height,
-                            (float)data->gif_frame_height,
+                            (float)data->anim_frame_height,
                             (float)data->crosshair_tex_width, 1.0f,
                             uv_top, uv_bot);
 
@@ -1918,7 +1887,7 @@ static krosshair_draw_t* render_swapchain_display(
                 }
         }
 
-        size_t vertex_size = sizeof(vertices);
+        size_t vertex_size = sizeof(data->vertices);
         size_t index_size  = sizeof(indices);
         if (draw->vertex_buffer_size < vertex_size) {
                 create_or_resize_buffer(device_data, &draw->vertex_buffer,
@@ -1940,7 +1909,7 @@ static krosshair_draw_t* render_swapchain_display(
                 VK_CHECK(device_data->vtable.MapMemory(
                     device_data->device, draw->vertex_buffer_mem, 0,
                     draw->vertex_buffer_size, 0, &vtx_dst));
-                memcpy(vtx_dst, vertices, sizeof(vertices));
+                memcpy(vtx_dst, data->vertices, sizeof(data->vertices));
 
                 VkMappedMemoryRange vtx_range = {};
                 vtx_range.sType               = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -2419,13 +2388,17 @@ static void instance_data_map_physical_devices(instance_data_t* instance_data,
 
         for (uint32_t i = 0; i < physical_device_count; i++) {
                 if (map) {
-                        printf("[*] mapping physical_devices[%d] obj: %lu %p\n",
-                               i, HKEY(physical_devices[i]), instance_data);
+                        KROSSHAIR_LOG("[*] mapping physical_devices[%d] obj: %lu %p\n",
+                               i, HKEY(physical_devices[i]), (void*)instance_data);
                         char* fmt_phys_device;
                         asprintf(&fmt_phys_device, "physical_devices[%d]", i);
                         map_object(HKEY(physical_devices[i]), instance_data,
                                    fmt_phys_device);
                 } else {
+                        /* free the name string we allocated with asprintf */
+                        vk_object_t obj;
+                        if (vk_map_get(&vk_obj_map, HKEY(physical_devices[i]), &obj))
+                                free((char*)obj.name);
                         unmap_object(HKEY(physical_devices[i]));
                 }
         }
@@ -2440,8 +2413,8 @@ static swapchain_data_t* new_swapchain_data(VkSwapchainKHR swapchain,
         memset(swapchain_data, 0, sizeof(*swapchain_data));
         swapchain_data->device_data = device_data;
         swapchain_data->swapchain   = swapchain;
-        printf("[*] mapping data->swapchain obj: %lu %p\n",
-               HKEY(swapchain_data->swapchain), swapchain_data);
+        KROSSHAIR_LOG("[*] mapping data->swapchain obj: %lu %p\n",
+               HKEY(swapchain_data->swapchain), (void*)swapchain_data);
         map_object(HKEY(swapchain_data->swapchain), swapchain_data,
                    "swapchain_data->swapchain");
         return swapchain_data;
@@ -2547,8 +2520,8 @@ static queue_data_t* new_queue_data(VkQueue queue,
         queue_data->queue        = queue;
         queue_data->flags        = family_props->queueFlags;
         queue_data->family_index = family_index;
-        printf("[*] mapping data->queue obj: %lu %p\n", HKEY(queue_data->queue),
-               queue_data);
+        KROSSHAIR_LOG("[*] mapping data->queue obj: %lu %p\n", HKEY(queue_data->queue),
+               (void*)queue_data);
         map_object(HKEY(queue_data->queue), queue_data, "queue_data->queue");
 
         if (queue_data->flags & VK_QUEUE_GRAPHICS_BIT) {

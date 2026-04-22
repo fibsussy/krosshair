@@ -7,6 +7,7 @@ on:
 jobs:
   check-skip:
     runs-on: ubuntu-latest
+    container: archlinux:latest
     outputs:
       should_skip: ${{ steps.check.outputs.skip }}
     steps:
@@ -24,16 +25,20 @@ jobs:
     needs: [check-skip]
     if: needs.check-skip.outputs.should_skip == 'false'
     runs-on: ubuntu-latest
+    container: archlinux:latest
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
       old_version: ${{ steps.bump.outputs.old_version }}
     steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm git
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Determine version bump
         id: bump
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
           OLD_VERSION=${LAST_TAG#v}
           IFS='.' read -r MAJOR MINOR PATCH <<< "$OLD_VERSION"
@@ -61,16 +66,15 @@ jobs:
   build:
     needs: [version]
     runs-on: ubuntu-latest
+    container: archlinux:latest
     steps:
+      - name: Install system dependencies
+        run: pacman -Syu --noconfirm base-devel vulkan-headers vulkan-icd-loader libx11 libgl git
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvulkan-dev libgl-dev libx11-dev gcc make
       - name: Build binary
-        run: make
+        run: make release
       - name: Determine architecture
         id: arch
         run: |
@@ -90,10 +94,11 @@ jobs:
         run: |
           ARCH_NAME=${{ steps.arch.outputs.arch_name }}
           VERSION=${{ needs.version.outputs.new_version }}
-          mkdir -p krosshair-linux-${ARCH_NAME}
+          mkdir -p krosshair-linux-${ARCH_NAME}/crosshairs
           cp lib/krosshair.so krosshair-linux-${ARCH_NAME}/
           cp krosshair.json krosshair-linux-${ARCH_NAME}/
           cp LICENSE krosshair-linux-${ARCH_NAME}/ 2>/dev/null || true
+          cp -r crosshairs/* krosshair-linux-${ARCH_NAME}/crosshairs/ 2>/dev/null || true
           tar -czf krosshair-linux-${ARCH_NAME}.tar.gz -C krosshair-linux-${ARCH_NAME} .
           sha256sum krosshair-linux-${ARCH_NAME}.tar.gz > krosshair-linux-${ARCH_NAME}.sha256
       - name: Upload build artifacts
@@ -109,9 +114,12 @@ jobs:
   release:
     needs: [version, build]
     runs-on: ubuntu-latest
+    container: archlinux:latest
     permissions:
       contents: write
     steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm git github-cli
       - uses: actions/checkout@v5
         with:
           ref: main
@@ -122,6 +130,7 @@ jobs:
           path: .
       - name: Configure git
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
           gh auth setup-git
@@ -167,7 +176,7 @@ jobs:
       - name: Push to AUR
         run: |
           VERSION=${{ needs.version.outputs.new_version }}
-          pacman -Sy --noconfirm openssh git sudo
+          pacman -Syu --noconfirm openssh git sudo base-devel
 
           useradd -m builduser
           echo "builduser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers

@@ -6,14 +6,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container: archlinux:latest
     steps:
-      - uses: actions/checkout@v5
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvulkan-dev libgl-dev libx11-dev gcc make
+        run: pacman -Syu --noconfirm base-devel vulkan-headers vulkan-icd-loader libx11 libgl git
+      - uses: actions/checkout@v5
       - name: Build binary
-        run: make
+        run: make release
       - name: Create tarball
         run: |
           ARCH=$(uname -m)
