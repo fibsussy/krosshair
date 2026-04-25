@@ -348,6 +348,10 @@ typedef struct krosshair_draw {
         VkDeviceMemory vertex_buffer_mem;
         VkDeviceSize vertex_buffer_size;
 
+        VkBuffer vertex_buffer2;       /* separate vertex buffer for dynamic mask */
+        VkDeviceMemory vertex_buffer2_mem;
+        VkDeviceSize vertex_buffer2_size;
+
         VkBuffer index_buffer;
         VkDeviceMemory index_buffer_mem;
         VkDeviceSize index_buffer_size;
@@ -2137,6 +2141,14 @@ static void destroy_draw(swapchain_data_t* data, krosshair_draw_t* draw)
                 device_data->vtable.FreeMemory(device_data->device,
                                                draw->vertex_buffer_mem, NULL);
         }
+        if (draw->vertex_buffer2 != VK_NULL_HANDLE) {
+                device_data->vtable.DestroyBuffer(device_data->device,
+                                                  draw->vertex_buffer2, NULL);
+        }
+        if (draw->vertex_buffer2_mem != VK_NULL_HANDLE) {
+                device_data->vtable.FreeMemory(device_data->device,
+                                               draw->vertex_buffer2_mem, NULL);
+        }
         if (draw->index_buffer != VK_NULL_HANDLE) {
                 device_data->vtable.DestroyBuffer(device_data->device,
                                                   draw->index_buffer, NULL);
@@ -2501,25 +2513,32 @@ static krosshair_draw_t* render_swapchain_display(
          * Uses the shader pipeline that samples the game FB copy.
          * Only runs if the dynamic mask is uploaded and the shader pipeline exists.
          */
-        if (data->dynamic_mask.uploaded && data->shader_pipeline && data->game_fb_image_view) {
-                /* re-upload dynamic mask vertices */
-                {
-                        void* vtx_dst = NULL;
-                        VK_CHECK(device_data->vtable.MapMemory(
-                            device_data->device, draw->vertex_buffer_mem, 0,
-                            draw->vertex_buffer_size, 0, &vtx_dst));
-                        memcpy(vtx_dst, data->dynamic_mask.vertices,
-                               sizeof(data->dynamic_mask.vertices));
-
-                        VkMappedMemoryRange vtx_range = {};
-                        vtx_range.sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-                        vtx_range.memory = draw->vertex_buffer_mem;
-                        vtx_range.size   = VK_WHOLE_SIZE;
-                        VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
-                            device_data->device, 1, &vtx_range));
-                        device_data->vtable.UnmapMemory(device_data->device,
-                                                        draw->vertex_buffer_mem);
+if (data->dynamic_mask.uploaded && data->shader_pipeline && data->game_fb_image_view) {
+                /* ensure vertex_buffer2 exists for dynamic mask */
+                size_t vtx2_size = sizeof(data->dynamic_mask.vertices);
+                if (draw->vertex_buffer2_size < vtx2_size) {
+                        create_or_resize_buffer(device_data, &draw->vertex_buffer2,
+                                                &draw->vertex_buffer2_mem,
+                                                &draw->vertex_buffer2_size, vtx2_size,
+                                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
                 }
+
+                /* upload dynamic mask vertices to separate buffer */
+                void* vtx_dst = NULL;
+                VK_CHECK(device_data->vtable.MapMemory(
+                    device_data->device, draw->vertex_buffer2_mem, 0,
+                    draw->vertex_buffer2_size, 0, &vtx_dst));
+                memcpy(vtx_dst, data->dynamic_mask.vertices,
+                       sizeof(data->dynamic_mask.vertices));
+
+                VkMappedMemoryRange vtx_range = {};
+                vtx_range.sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                vtx_range.memory = draw->vertex_buffer2_mem;
+                vtx_range.size   = VK_WHOLE_SIZE;
+                VK_CHECK(device_data->vtable.FlushMappedMemoryRanges(
+                    device_data->device, 1, &vtx_range));
+                device_data->vtable.UnmapMemory(device_data->device,
+                                                draw->vertex_buffer2_mem);
 
                 device_data->vtable.CmdBindPipeline(
                     draw->cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -2527,7 +2546,7 @@ static krosshair_draw_t* render_swapchain_display(
 
                 VkDeviceSize mask_offsets[1] = {0};
                 device_data->vtable.CmdBindVertexBuffers(
-                    draw->cmd_buffer, 0, 1, &draw->vertex_buffer, mask_offsets);
+                    draw->cmd_buffer, 0, 1, &draw->vertex_buffer2, mask_offsets);
 
                 /* allocate/update descriptor set for mask + game_fb if needed */
                 if (!data->shader_mask_desc_set) {
