@@ -25,6 +25,7 @@ layout(push_constant) uniform PushConstants {
     float huerotate_angle;   // Hue Rotate angle (degrees)
     float saturate_str;      // Saturate strength
     float saturate_amount;   // Saturate amount (0-1)
+    float opacity;           // Overall effect opacity (0-1)
 } pc;
 
 // ── RGB <-> HSL conversions ──────────────────────────────────────
@@ -75,14 +76,15 @@ vec3 hsl_to_rgb(vec3 hsl) {
 }
 
 void main() {
-    // Binary mask: check red channel (grayscale)
+    // Continuous mask: use red channel (grayscale) as blend factor
     float mask = texture(mask_sampler, frag_tex_coord).r;
-    if (mask < 0.5) discard;
+    if (mask < 0.004) discard; // ~1/255, skip fully transparent pixels
 
     // Sample game framebuffer
     vec2 ndc = pc.quad_ndc_min + frag_tex_coord * pc.quad_ndc_size;
     vec2 screen_uv = ndc * 0.5 + 0.5;
-    vec3 color = texture(game_fb_sampler, screen_uv).rgb;
+    vec3 original = texture(game_fb_sampler, screen_uv).rgb;
+    vec3 color = original;
 
     // Fixed order: invert → dodge → burn → complement → luma_invert → hue_rotate → saturate
 
@@ -116,17 +118,24 @@ void main() {
 
     if (pc.huerotate_str > 0.0) {
         vec3 hsl = rgb_to_hsl(color);
+        float original_l = hsl.z;
         hsl.x = mod(hsl.x + pc.huerotate_angle / 360.0, 1.0);
-        hsl.z = 1.0 - hsl.z;
+        // hsl.y keeps original saturation, L = 1.0 - original_L matches crosshair-maker
+        hsl.z = 1.0 - original_l;
         color = mix(color, hsl_to_rgb(hsl), pc.huerotate_str);
     }
 
     if (pc.saturate_str > 0.0) {
         vec3 hsl = rgb_to_hsl(color);
+        // Match crosshair-maker: hsl_to_rgb_f32(h, amount, 1.0 - original_l)
+        float original_l = hsl.z;
         hsl.y = pc.saturate_amount;
-        hsl.z = 1.0 - hsl.z;
+        hsl.z = 1.0 - original_l;  // Match crosshair-maker formula
         color = mix(color, hsl_to_rgb(hsl), pc.saturate_str);
     }
+
+    // Apply overall opacity, then blend by mask alpha (supports anti-aliased edges)
+    color = mix(original, color, mask * pc.opacity);
 
     out_color = vec4(color, 1.0);
 }

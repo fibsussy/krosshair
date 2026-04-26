@@ -374,8 +374,9 @@ struct dynamic_push_constants {
         float huerotate_angle;    /* 4        */
         float saturate_str;       /* 4        */
         float saturate_amount;    /* 4        */
+        float opacity;            /* 4        */
 };
-/* Total: 76 bytes (19 floats) */
+/* Total: 80 bytes (20 floats) */
 
 static void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* pc)
 {
@@ -391,6 +392,7 @@ static void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* p
         pc->huerotate_angle = 180.0f;
         pc->saturate_str    = 0.0f;
         pc->saturate_amount = 0.0f;
+        pc->opacity         = 1.0f;
 
         if (!path) return;
 
@@ -426,6 +428,8 @@ static void parse_dynamic_cfg(const char* path, struct dynamic_push_constants* p
                 } else if (strcmp(name, "saturate") == 0) {
                         pc->saturate_str = a1;
                         if (n >= 3) pc->saturate_amount = a2;
+                } else if (strcmp(name, "opacity") == 0) {
+                        pc->opacity = a1;
                 }
         }
         fclose(f);
@@ -2954,7 +2958,7 @@ static void setup_swapchain_data_pipeline(swapchain_data_t* data)
                     device_data->device, &sdl_info, NULL,
                     &data->shader_desc_layout));
 
-                /* push constant range: full dynamic_push_constants (76 bytes) */
+                /* push constant range: full dynamic_push_constants (80 bytes) */
                 VkPushConstantRange pc_range = {};
                 pc_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
                 pc_range.offset     = 0;
